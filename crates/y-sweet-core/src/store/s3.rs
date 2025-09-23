@@ -90,19 +90,56 @@ impl S3Store {
 
         match response.status() {
             StatusCode::OK => Ok(response),
-            StatusCode::NOT_FOUND => Err(StoreError::DoesNotExist(
-                "Received NOT_FOUND from S3-compatible API.".to_string(),
-            )),
-            StatusCode::FORBIDDEN => Err(StoreError::NotAuthorized(
-                "Received FORBIDDEN from S3-compatible API.".to_string(),
-            )),
-            StatusCode::UNAUTHORIZED => Err(StoreError::NotAuthorized(
-                "Received UNAUTHORIZED from S3-compatible API.".to_string(),
-            )),
-            _ => Err(StoreError::ConnectionError(format!(
-                "Received {} from S3-compatible API.",
-                response.status()
-            ))),
+            StatusCode::NOT_FOUND => {
+                tracing::debug!(
+                    status = %response.status(),
+                    headers = ?response.headers(),
+                    "Received NOT_FOUND from S3-compatible API"
+                );
+                Err(StoreError::DoesNotExist(
+                    "Received NOT_FOUND from S3-compatible API.".to_string(),
+                ))
+            }
+            StatusCode::FORBIDDEN => {
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
+                tracing::error!(
+                    status = %StatusCode::FORBIDDEN,
+                    headers = ?headers,
+                    body = %body,
+                    "Received FORBIDDEN from S3-compatible API"
+                );
+                Err(StoreError::NotAuthorized(
+                    format!("Received FORBIDDEN from S3-compatible API. Body: {}", body),
+                ))
+            }
+            StatusCode::UNAUTHORIZED => {
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
+                tracing::error!(
+                    status = %StatusCode::UNAUTHORIZED,
+                    headers = ?headers,
+                    body = %body,
+                    "Received UNAUTHORIZED from S3-compatible API"
+                );
+                Err(StoreError::NotAuthorized(
+                    format!("Received UNAUTHORIZED from S3-compatible API. Body: {}", body),
+                ))
+            }
+            status => {
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
+                tracing::error!(
+                    status = %status,
+                    headers = ?headers,
+                    body = %body,
+                    "Received error response from S3-compatible API"
+                );
+                Err(StoreError::ConnectionError(format!(
+                    "Received {} from S3-compatible API. Body: {}",
+                    status, body
+                )))
+            }
         }
     }
 
