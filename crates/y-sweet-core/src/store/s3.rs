@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tokio::time::sleep;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct S3Config {
@@ -24,6 +25,8 @@ pub struct S3Config {
 }
 
 const PRESIGNED_URL_DURATION: Duration = Duration::from_secs(60 * 60);
+const MAX_RETRIES: u32 = 3;
+const BASE_RETRY_DELAY_MS: u64 = 100;
 
 pub struct S3Store {
     bucket: Bucket,
@@ -72,73 +75,137 @@ impl S3Store {
         action: A,
         body: Option<Vec<u8>>,
     ) -> Result<Response> {
-        let url = action.sign_with_time(PRESIGNED_URL_DURATION, &OffsetDateTime::now_utc());
-        let mut request = self.client.request(method, url);
-
-        request = if let Some(body) = body {
-            request.body(body.to_vec())
-        } else {
-            request
-        };
-
-        let response = request.send().await;
-
-        let response = match response {
-            Ok(response) => response,
-            Err(e) => return Err(StoreError::ConnectionError(e.to_string())),
-        };
-
-        match response.status() {
-            StatusCode::OK => Ok(response),
-            StatusCode::NOT_FOUND => {
+        let mut attempt = 0;
+        
+        loop {
+            let url = action.sign_with_time(PRESIGNED_URL_DURATION, &OffsetDateTime::now_utc());
+            
+            // Log every request attempt
+            if attempt == 0 {
                 tracing::debug!(
-                    status = %response.status(),
-                    headers = ?response.headers(),
-                    "Received NOT_FOUND from S3-compatible API"
+                    method = %method,
+                    url = %url,
+                    "Sending S3 request"
                 );
-                Err(StoreError::DoesNotExist(
-                    "Received NOT_FOUND from S3-compatible API.".to_string(),
-                ))
+            } else {
+                tracing::debug!(
+                    method = %method,
+                    url = %url,
+                    attempt = attempt + 1,
+                    "Retrying S3 request"
+                );
             }
-            StatusCode::FORBIDDEN => {
-                let headers = response.headers().clone();
-                let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
-                tracing::error!(
-                    status = %StatusCode::FORBIDDEN,
-                    headers = ?headers,
-                    body = %body,
-                    "Received FORBIDDEN from S3-compatible API"
-                );
-                Err(StoreError::NotAuthorized(
-                    format!("Received FORBIDDEN from S3-compatible API. Body: {}", body),
-                ))
-            }
-            StatusCode::UNAUTHORIZED => {
-                let headers = response.headers().clone();
-                let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
-                tracing::error!(
-                    status = %StatusCode::UNAUTHORIZED,
-                    headers = ?headers,
-                    body = %body,
-                    "Received UNAUTHORIZED from S3-compatible API"
-                );
-                Err(StoreError::NotAuthorized(
-                    format!("Received UNAUTHORIZED from S3-compatible API. Body: {}", body),
-                ))
-            }
-            status => {
-                let headers = response.headers().clone();
-                let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
-                tracing::error!(
-                    status = %status,
-                    headers = ?headers,
-                    body = %body,
-                    "Received error response from S3-compatible API"
-                );
-                Err(StoreError::ConnectionError(format!(
-                    "Received {} from S3-compatible API. Body: {}",
-                    status, body
-                )))
+            
+            let mut request = self.client.request(method.clone(), url);
+
+            request = if let Some(ref body) = body {
+                request.body(body.clone())
+            } else {
+                request
+            };
+
+            let response = request.send().await;
+
+            let response = match response {
+                Ok(response) => response,
+                Err(e) => return Err(StoreError::ConnectionError(e.to_string())),
+            };
+
+            match response.status() {
+                StatusCode::OK => return Ok(response),
+                StatusCode::NOT_FOUND => {
+                    tracing::debug!(
+                        status = %response.status(),
+                        headers = ?response.headers(),
+                        "Received NOT_FOUND from S3-compatible API"
+                    );
+                    return Err(StoreError::DoesNotExist(
+                        "Received NOT_FOUND from S3-compatible API.".to_string(),
+                    ));
+                }
+                StatusCode::FORBIDDEN => {
+                    let headers = response.headers().clone();
+                    let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
+                    tracing::error!(
+                        status = %StatusCode::FORBIDDEN,
+                        headers = ?headers,
+                        body = %body,
+                        "Received FORBIDDEN from S3-compatible API"
+                    );
+                    return Err(StoreError::NotAuthorized(
+                        format!("Received FORBIDDEN from S3-compatible API. Body: {}", body),
+                    ));
+                }
+                StatusCode::UNAUTHORIZED => {
+                    let headers = response.headers().clone();
+                    let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
+                    tracing::error!(
+                        status = %StatusCode::UNAUTHORIZED,
+                        headers = ?headers,
+                        body = %body,
+                        "Received UNAUTHORIZED from S3-compatible API"
+                    );
+                    return Err(StoreError::NotAuthorized(
+                        format!("Received UNAUTHORIZED from S3-compatible API. Body: {}", body),
+                    ));
+                }
+                StatusCode::SERVICE_UNAVAILABLE => {
+                    let headers = response.headers().clone();
+                    let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
+                    
+                    // Check if this is a SlowDown error
+                    if body.contains("SlowDown") {
+                        if attempt < MAX_RETRIES {
+                            let delay_ms = BASE_RETRY_DELAY_MS * 2_u64.pow(attempt);
+                            tracing::warn!(
+                                method = %method,
+                                attempt = attempt + 1,
+                                delay_ms = delay_ms,
+                                "S3 SlowDown error - retrying with exponential backoff"
+                            );
+                            
+                            attempt += 1;
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            continue; // Retry the request
+                        } else {
+                            tracing::error!(
+                                method = %method,
+                                attempts = attempt + 1,
+                                "S3 SlowDown error - max retries exceeded"
+                            );
+                            return Err(StoreError::ConnectionError(format!(
+                                "S3 SlowDown error after {} attempts. Body: {}",
+                                attempt + 1, body
+                            )));
+                        }
+                    } else {
+                        // Non-SlowDown 503 error, don't retry
+                        tracing::error!(
+                            status = %StatusCode::SERVICE_UNAVAILABLE,
+                            headers = ?headers,
+                            body = %body,
+                            "Received 503 (non-SlowDown) from S3-compatible API"
+                        );
+                        return Err(StoreError::ConnectionError(format!(
+                            "Received 503 from S3-compatible API. Body: {}",
+                            body
+                        )));
+                    }
+                }
+                status => {
+                    let headers = response.headers().clone();
+                    let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
+                    tracing::error!(
+                        status = %status,
+                        headers = ?headers,
+                        body = %body,
+                        "Received error response from S3-compatible API"
+                    );
+                    return Err(StoreError::ConnectionError(format!(
+                        "Received {} from S3-compatible API. Body: {}",
+                        status, body
+                    )));
+                }
             }
         }
     }
