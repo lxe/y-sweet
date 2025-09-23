@@ -121,8 +121,9 @@ fn parse_s3_config_from_env_and_args(
             .map_err(|_| anyhow::anyhow!("{} env var not supplied", S3_ACCESS_KEY_ID))?,
         region: env::var(S3_REGION).unwrap_or_else(|_| DEFAULT_S3_REGION.to_string()),
         endpoint: env::var(S3_ENDPOINT).unwrap_or_else(|_| {
+            // Use standard IPv4-only endpoint instead of dualstack for better container compatibility
             format!(
-                "https://s3.dualstack.{}.amazonaws.com",
+                "https://s3.{}.amazonaws.com",
                 env::var(S3_REGION).unwrap_or_else(|_| DEFAULT_S3_REGION.to_string())
             )
         }),

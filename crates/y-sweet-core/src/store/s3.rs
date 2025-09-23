@@ -5,6 +5,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use aws_smithy_types;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tracing;
@@ -44,8 +45,16 @@ impl S3Store {
             return Ok(client);
         }
 
+        // Configure timeouts for better reliability
+        let timeout_config = aws_smithy_types::timeout::TimeoutConfig::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(30))
+            .operation_timeout(std::time::Duration::from_secs(60))
+            .build();
+
         let mut aws_config_builder = aws_config::defaults(BehaviorVersion::latest())
             .region(aws_config::Region::new(self.config.region.clone()))
+            .timeout_config(timeout_config)
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
                 self.config.key.clone(),
                 self.config.secret.clone(),
@@ -54,8 +63,16 @@ impl S3Store {
                 "y-sweet",
             ));
 
-        if !self.config.endpoint.is_empty() && self.config.endpoint != "https://s3.amazonaws.com" {
-            aws_config_builder = aws_config_builder.endpoint_url(&self.config.endpoint);
+        // Use standard S3 endpoint instead of dualstack if no custom endpoint is provided
+        let effective_endpoint = if self.config.endpoint.is_empty() {
+            format!("https://s3.{}.amazonaws.com", self.config.region)
+        } else {
+            self.config.endpoint.clone()
+        };
+
+        if effective_endpoint != "https://s3.amazonaws.com" {
+            tracing::debug!("Using S3 endpoint: {}", effective_endpoint);
+            aws_config_builder = aws_config_builder.endpoint_url(&effective_endpoint);
         }
 
         let aws_config = aws_config_builder.load().await;
