@@ -5,8 +5,8 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use aws_smithy_types;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::sync::OnceLock;
 use tracing;
 
@@ -33,10 +33,34 @@ pub struct S3Store {
 
 impl S3Store {
     pub fn new(config: S3Config) -> Self {
+        // Ensure SSL_CERT_FILE is set to help rustls find native certificates
+        Self::ensure_ssl_cert_file_set();
+        
         S3Store {
             client: OnceLock::new(),
             config,
             _bucket_checked: OnceLock::new(),
+        }
+    }
+
+    /// Ensure SSL_CERT_FILE environment variable is set to help rustls find CA certificates
+    fn ensure_ssl_cert_file_set() {
+        if env::var("SSL_CERT_FILE").is_err() {
+            // Try common locations for CA certificates in Docker containers
+            let cert_paths = [
+                "/etc/ssl/certs/ca-certificates.crt",  // Debian/Ubuntu
+                "/etc/pki/tls/certs/ca-bundle.crt",    // RedHat/CentOS
+                "/etc/ssl/ca-bundle.pem",               // OpenSUSE
+                "/etc/ssl/cert.pem",                    // Alpine
+            ];
+            
+            for cert_path in &cert_paths {
+                if std::path::Path::new(cert_path).exists() {
+                    env::set_var("SSL_CERT_FILE", cert_path);
+                    tracing::info!("Set SSL_CERT_FILE to {}", cert_path);
+                    break;
+                }
+            }
         }
     }
 
@@ -45,16 +69,8 @@ impl S3Store {
             return Ok(client);
         }
 
-        // Configure timeouts for better reliability
-        let timeout_config = aws_smithy_types::timeout::TimeoutConfig::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(std::time::Duration::from_secs(30))
-            .operation_timeout(std::time::Duration::from_secs(60))
-            .build();
-
         let mut aws_config_builder = aws_config::defaults(BehaviorVersion::latest())
             .region(aws_config::Region::new(self.config.region.clone()))
-            .timeout_config(timeout_config)
             .credentials_provider(aws_sdk_s3::config::Credentials::new(
                 self.config.key.clone(),
                 self.config.secret.clone(),
@@ -63,16 +79,8 @@ impl S3Store {
                 "y-sweet",
             ));
 
-        // Use standard S3 endpoint instead of dualstack if no custom endpoint is provided
-        let effective_endpoint = if self.config.endpoint.is_empty() {
-            format!("https://s3.{}.amazonaws.com", self.config.region)
-        } else {
-            self.config.endpoint.clone()
-        };
-
-        if effective_endpoint != "https://s3.amazonaws.com" {
-            tracing::debug!("Using S3 endpoint: {}", effective_endpoint);
-            aws_config_builder = aws_config_builder.endpoint_url(&effective_endpoint);
+        if !self.config.endpoint.is_empty() && self.config.endpoint != "https://s3.amazonaws.com" {
+            aws_config_builder = aws_config_builder.endpoint_url(&self.config.endpoint);
         }
 
         let aws_config = aws_config_builder.load().await;
