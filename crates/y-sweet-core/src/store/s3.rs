@@ -1,14 +1,13 @@
 use super::{Result, StoreError};
 use crate::store::Store;
 use async_trait::async_trait;
-use bytes::Bytes;
-use reqwest::{Client, Method, Response, StatusCode, Url};
-use rusty_s3::{Bucket, Credentials, S3Action};
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use std::time::Duration;
-use time::OffsetDateTime;
-use tokio::time::sleep;
+use tracing;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct S3Config {
@@ -24,196 +23,154 @@ pub struct S3Config {
     pub path_style: bool,
 }
 
-const PRESIGNED_URL_DURATION: Duration = Duration::from_secs(60 * 60);
-const MAX_RETRIES: u32 = 3;
-const BASE_RETRY_DELAY_MS: u64 = 100;
 
 pub struct S3Store {
-    bucket: Bucket,
+    client: OnceLock<Client>,
+    config: S3Config,
     _bucket_checked: OnceLock<()>,
-    client: Client,
-    credentials: Credentials,
-    prefix: Option<String>,
 }
 
 impl S3Store {
     pub fn new(config: S3Config) -> Self {
-        let credentials = if let Some(token) = config.token {
-            Credentials::new_with_token(config.key, config.secret, token)
-        } else {
-            Credentials::new(config.key, config.secret)
-        };
-        let endpoint: Url = config.endpoint.parse().expect("endpoint is a valid url");
-
-        let path_style = if config.path_style {
-            rusty_s3::UrlStyle::Path
-        } else if endpoint.host_str() == Some("localhost") {
-            // Since this was the old behavior before we added AWS_S3_USE_PATH_STYLE,
-            // we continue to support it, but complain a bit.
-            tracing::warn!("Inferring path-style URLs for localhost for backwards-compatibility. This behavior may change in the future. Set AWS_S3_USE_PATH_STYLE=true to ensure that path-style URLs are used.");
-            rusty_s3::UrlStyle::Path
-        } else {
-            rusty_s3::UrlStyle::VirtualHost
-        };
-
-        let bucket = Bucket::new(endpoint, path_style, config.bucket, config.region)
-            .expect("Url has a valid scheme and host");
-        let client = Client::new();
-
         S3Store {
-            bucket,
+            client: OnceLock::new(),
+            config,
             _bucket_checked: OnceLock::new(),
-            client,
-            credentials,
-            prefix: config.bucket_prefix,
         }
     }
 
-    async fn store_request<'a, A: S3Action<'a>>(
-        &self,
-        method: Method,
-        action: A,
-        body: Option<Vec<u8>>,
-    ) -> Result<Response> {
-        let mut attempt = 0;
+    async fn get_client(&self) -> Result<&Client> {
+        if let Some(client) = self.client.get() {
+            return Ok(client);
+        }
+
+        let mut aws_config_builder = aws_config::defaults(BehaviorVersion::latest())
+            .region(aws_config::Region::new(self.config.region.clone()))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                self.config.key.clone(),
+                self.config.secret.clone(),
+                self.config.token.clone(),
+                None,
+                "y-sweet",
+            ));
+
+        if !self.config.endpoint.is_empty() && self.config.endpoint != "https://s3.amazonaws.com" {
+            aws_config_builder = aws_config_builder.endpoint_url(&self.config.endpoint);
+        }
+
+        let aws_config = aws_config_builder.load().await;
         
-        loop {
-            let url = action.sign_with_time(PRESIGNED_URL_DURATION, &OffsetDateTime::now_utc());
-            
-            // Log every request attempt
-            if attempt == 0 {
-                tracing::debug!(
-                    method = %method,
-                    url = %url,
-                    "Sending S3 request"
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&aws_config);
+        
+        if self.config.path_style {
+            s3_config_builder = s3_config_builder.force_path_style(true);
+        }
+
+        let s3_config = s3_config_builder.build();
+        let client = Client::from_conf(s3_config);
+
+        match self.client.set(client) {
+            Ok(()) => Ok(self.client.get().unwrap()),
+            Err(_) => Ok(self.client.get().unwrap()), // Another thread set it first
+        }
+    }
+
+    /// Helper function to handle AWS SDK errors and convert them to StoreError
+    fn handle_aws_error<E>(error: SdkError<E>, operation: &str, bucket: &str, key: Option<&str>) -> StoreError 
+    where
+        E: std::fmt::Debug + std::fmt::Display,
+    {
+        match &error {
+            SdkError::ServiceError(service_error) => {
+                let raw_response = service_error.raw();
+                let status_code = raw_response.status().as_u16();
+                let headers = raw_response.headers();
+                let body = raw_response.body().bytes().map(|bytes| {
+                    String::from_utf8_lossy(bytes).to_string()
+                }).unwrap_or_else(|| "<body not available>".to_string());
+                
+                tracing::error!(
+                    error_type = "ServiceError",
+                    operation = operation,
+                    bucket = bucket,
+                    key = key,
+                    status_code = status_code,
+                    headers = ?headers,
+                    response_body = %body,
+                    service_error = %service_error.err(),
+                    "AWS S3 service error occurred"
                 );
-            } else {
-                tracing::debug!(
-                    method = %method,
-                    url = %url,
-                    attempt = attempt + 1,
-                    "Retrying S3 request"
-                );
+                
+                match status_code {
+                    404 => StoreError::DoesNotExist("Object not found".to_string()),
+                    403 => StoreError::NotAuthorized("Access denied".to_string()),
+                    401 => StoreError::NotAuthorized("Unauthorized".to_string()),
+                    _ => StoreError::ConnectionError(format!("Service error: {}", service_error.err())),
+                }
             }
-            
-            let mut request = self.client.request(method.clone(), url);
-
-            request = if let Some(ref body) = body {
-                request.body(body.clone())
-            } else {
-                request
-            };
-
-            let response = request.send().await;
-
-            let response = match response {
-                Ok(response) => response,
-                Err(e) => return Err(StoreError::ConnectionError(e.to_string())),
-            };
-
-            match response.status() {
-                StatusCode::OK => return Ok(response),
-                StatusCode::NOT_FOUND => {
-                    tracing::debug!(
-                        status = %response.status(),
-                        headers = ?response.headers(),
-                        "Received NOT_FOUND from S3-compatible API"
-                    );
-                    return Err(StoreError::DoesNotExist(
-                        "Received NOT_FOUND from S3-compatible API.".to_string(),
-                    ));
-                }
-                StatusCode::FORBIDDEN => {
-                    let headers = response.headers().clone();
-                    let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
-                    tracing::error!(
-                        status = %StatusCode::FORBIDDEN,
-                        headers = ?headers,
-                        body = %body,
-                        "Received FORBIDDEN from S3-compatible API"
-                    );
-                    return Err(StoreError::NotAuthorized(
-                        format!("Received FORBIDDEN from S3-compatible API. Body: {}", body),
-                    ));
-                }
-                StatusCode::UNAUTHORIZED => {
-                    let headers = response.headers().clone();
-                    let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
-                    tracing::error!(
-                        status = %StatusCode::UNAUTHORIZED,
-                        headers = ?headers,
-                        body = %body,
-                        "Received UNAUTHORIZED from S3-compatible API"
-                    );
-                    return Err(StoreError::NotAuthorized(
-                        format!("Received UNAUTHORIZED from S3-compatible API. Body: {}", body),
-                    ));
-                }
-                StatusCode::SERVICE_UNAVAILABLE => {
-                    let headers = response.headers().clone();
-                    let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
-                    
-                    // Check if this is a SlowDown error
-                    if body.contains("SlowDown") {
-                        if attempt < MAX_RETRIES {
-                            let delay_ms = BASE_RETRY_DELAY_MS * 2_u64.pow(attempt);
-                            tracing::warn!(
-                                method = %method,
-                                attempt = attempt + 1,
-                                delay_ms = delay_ms,
-                                "S3 SlowDown error - retrying with exponential backoff"
-                            );
-                            
-                            attempt += 1;
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                            continue; // Retry the request
-                        } else {
-                            tracing::error!(
-                                method = %method,
-                                attempts = attempt + 1,
-                                "S3 SlowDown error - max retries exceeded"
-                            );
-                            return Err(StoreError::ConnectionError(format!(
-                                "S3 SlowDown error after {} attempts. Body: {}",
-                                attempt + 1, body
-                            )));
-                        }
-                    } else {
-                        // Non-SlowDown 503 error, don't retry
-                        tracing::error!(
-                            status = %StatusCode::SERVICE_UNAVAILABLE,
-                            headers = ?headers,
-                            body = %body,
-                            "Received 503 (non-SlowDown) from S3-compatible API"
-                        );
-                        return Err(StoreError::ConnectionError(format!(
-                            "Received 503 from S3-compatible API. Body: {}",
-                            body
-                        )));
-                    }
-                }
-                status => {
-                    let headers = response.headers().clone();
-                    let body = response.text().await.unwrap_or_else(|e| format!("Failed to read response body: {}", e));
-                    tracing::error!(
-                        status = %status,
-                        headers = ?headers,
-                        body = %body,
-                        "Received error response from S3-compatible API"
-                    );
-                    return Err(StoreError::ConnectionError(format!(
-                        "Received {} from S3-compatible API. Body: {}",
-                        status, body
-                    )));
-                }
+            SdkError::TimeoutError(timeout_error) => {
+                tracing::error!(
+                    error_type = "TimeoutError",
+                    operation = operation,
+                    bucket = bucket,
+                    key = key,
+                    timeout_error = ?timeout_error,
+                    "AWS S3 request timeout"
+                );
+                StoreError::ConnectionError("Request timeout".to_string())
+            }
+            SdkError::ResponseError(response_error) => {
+                tracing::error!(
+                    error_type = "ResponseError",
+                    operation = operation,
+                    bucket = bucket,
+                    key = key,
+                    response_error = ?response_error,
+                    "AWS S3 response error"
+                );
+                StoreError::ConnectionError(format!("Response error: {:?}", response_error))
+            }
+            SdkError::DispatchFailure(dispatch_error) => {
+                tracing::error!(
+                    error_type = "DispatchFailure",
+                    operation = operation,
+                    bucket = bucket,
+                    key = key,
+                    dispatch_error = ?dispatch_error,
+                    "AWS S3 dispatch failure"
+                );
+                StoreError::ConnectionError(format!("Dispatch failure: {:?}", dispatch_error))
+            }
+            SdkError::ConstructionFailure(construction_error) => {
+                tracing::error!(
+                    error_type = "ConstructionFailure",
+                    operation = operation,
+                    bucket = bucket,
+                    key = key,
+                    construction_error = ?construction_error,
+                    "AWS S3 request construction failure"
+                );
+                StoreError::ConnectionError(format!("Construction failure: {:?}", construction_error))
+            }
+            _ => {
+                tracing::error!(
+                    error_type = "Other",
+                    operation = operation,
+                    bucket = bucket,
+                    key = key,
+                    error = %error,
+                    "Unknown AWS S3 error"
+                );
+                StoreError::ConnectionError(format!("AWS SDK error: {}", error))
             }
         }
     }
 
-    async fn read_response_bytes(response: Response) -> Result<Bytes> {
-        match response.bytes().await {
-            Ok(bytes) => Ok(bytes),
-            Err(e) => Err(StoreError::ConnectionError(e.to_string())),
+    fn prefixed_key(&self, key: &str) -> String {
+        if let Some(path_prefix) = &self.config.bucket_prefix {
+            format!("{}/{}", path_prefix, key)
+        } else {
+            key.to_string()
         }
     }
 
@@ -222,83 +179,106 @@ impl S3Store {
             return Ok(());
         }
 
-        let action = self.bucket.head_bucket(Some(&self.credentials));
-        let result = self.store_request(Method::HEAD, action, None).await;
-
-        match result {
-            // Normally a 404 indicates that we are attempting to fetch an object that does
-            // not exist, but we have only attempted to retrieve a bucket, so here it
-            // indicates that the bucket does not exist.
-            Err(StoreError::DoesNotExist(_)) => {
-                return Err(StoreError::BucketDoesNotExist(
-                    "Bucket does not exist.".to_string(),
-                ))
+        let client = self.get_client().await?;
+        
+        match client.head_bucket()
+            .bucket(&self.config.bucket)
+            .send()
+            .await 
+        {
+            Ok(_) => {
+                self._bucket_checked.set(()).unwrap();
+                Ok(())
             }
-            Err(e) => return Err(e),
-            Ok(response) => response,
-        };
-
-        self._bucket_checked.set(()).unwrap();
-        Ok(())
-    }
-
-    fn prefixed_key(&self, key: &str) -> String {
-        if let Some(path_prefix) = &self.prefix {
-            format!("{}/{}", path_prefix, key)
-        } else {
-            key.to_string()
+            Err(err) => {
+                match Self::handle_aws_error(err, "head_bucket", &self.config.bucket, None) {
+                    StoreError::DoesNotExist(_) => {
+                        Err(StoreError::BucketDoesNotExist(
+                            "Bucket does not exist.".to_string(),
+                        ))
+                    }
+                    e => Err(e),
+                }
+            }
         }
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let object_get = self
-            .bucket
-            .get_object(Some(&self.credentials), &prefixed_key);
-        let response = self.store_request(Method::GET, object_get, None).await;
-
-        match response {
-            Ok(response) => {
-                let result = Self::read_response_bytes(response).await?;
-                Ok(Some(result.to_vec()))
+        let client = self.get_client().await?;
+        
+        match client.get_object()
+            .bucket(&self.config.bucket)
+            .key(&prefixed_key)
+            .send()
+            .await 
+        {
+            Ok(output) => {
+                let bytes = output.body.collect().await
+                    .map_err(|e| StoreError::ConnectionError(format!("Failed to read object body: {}", e)))?;
+                Ok(Some(bytes.into_bytes().to_vec()))
             }
-            Err(StoreError::DoesNotExist(_)) => Ok(None),
-            Err(e) => Err(e),
+            Err(err) => {
+                match Self::handle_aws_error(err, "get_object", &self.config.bucket, Some(&prefixed_key)) {
+                    StoreError::DoesNotExist(_) => Ok(None),
+                    e => Err(e),
+                }
+            }
         }
     }
 
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let action = self
-            .bucket
-            .put_object(Some(&self.credentials), &prefixed_key);
-        self.store_request(Method::PUT, action, Some(value)).await?;
-        Ok(())
+        let client = self.get_client().await?;
+        
+        match client.put_object()
+            .bucket(&self.config.bucket)
+            .key(&prefixed_key)
+            .body(ByteStream::from(value))
+            .send()
+            .await 
+        {
+            Ok(_) => Ok(()),
+            Err(err) => Err(Self::handle_aws_error(err, "put_object", &self.config.bucket, Some(&prefixed_key))),
+        }
     }
 
     async fn remove(&self, key: &str) -> Result<()> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let action = self
-            .bucket
-            .delete_object(Some(&self.credentials), &prefixed_key);
-        self.store_request(Method::DELETE, action, None).await?;
-        Ok(())
+        let client = self.get_client().await?;
+        
+        match client.delete_object()
+            .bucket(&self.config.bucket)
+            .key(&prefixed_key)
+            .send()
+            .await 
+        {
+            Ok(_) => Ok(()),
+            Err(err) => Err(Self::handle_aws_error(err, "delete_object", &self.config.bucket, Some(&prefixed_key))),
+        }
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let action = self
-            .bucket
-            .head_object(Some(&self.credentials), &prefixed_key);
-        let response = self.store_request(Method::HEAD, action, None).await;
-        match response {
+        let client = self.get_client().await?;
+        
+        match client.head_object()
+            .bucket(&self.config.bucket)
+            .key(&prefixed_key)
+            .send()
+            .await 
+        {
             Ok(_) => Ok(true),
-            Err(StoreError::DoesNotExist(_)) => Ok(false),
-            Err(e) => Err(e),
+            Err(err) => {
+                match Self::handle_aws_error(err, "head_object", &self.config.bucket, Some(&prefixed_key)) {
+                    StoreError::DoesNotExist(_) => Ok(false),
+                    e => Err(e),
+                }
+            }
         }
     }
 }
