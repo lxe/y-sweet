@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tokio::time::sleep;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct S3Config {
@@ -164,7 +165,7 @@ impl S3Store {
                             );
                             
                             attempt += 1;
-                            sleep(Duration::from_millis(delay_ms)).await;
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             continue; // Retry the request
                         } else {
                             tracing::error!(
