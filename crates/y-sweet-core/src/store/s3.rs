@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::time::sleep;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct S3Config {
