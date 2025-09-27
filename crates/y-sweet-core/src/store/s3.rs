@@ -200,6 +200,8 @@ impl S3Store {
     }
 
     pub async fn init(&self) -> Result<()> {
+        // Check if we've already verified the bucket exists
+        // This prevents making a HEAD request on every single S3 operation
         if self._bucket_checked.get().is_some() {
             return Ok(());
         }
@@ -212,7 +214,8 @@ impl S3Store {
             .await 
         {
             Ok(_) => {
-                self._bucket_checked.set(()).unwrap();
+                // Use get_or_init to handle race conditions properly
+                self._bucket_checked.get_or_init(|| ());
                 Ok(())
             }
             Err(err) => {

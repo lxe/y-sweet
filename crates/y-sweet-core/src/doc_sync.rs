@@ -35,6 +35,7 @@ impl DocWithSyncKv {
         let sync_kv = Arc::new(sync_kv);
         let doc = Doc::new();
 
+        // Load the document FIRST, before attaching any observers
         {
             let mut txn = doc.transact_mut();
             sync_kv
@@ -42,13 +43,16 @@ impl DocWithSyncKv {
                 .map_err(|_| anyhow!("Failed to load doc"))?;
         }
 
+        // NOW attach the observer after the document is loaded
+        // This prevents the load operation from triggering the observer
         let subscription = {
             let sync_kv = sync_kv.clone();
             doc.observe_update_v1(move |_, event| {
+                // Push the update to the sync_kv store
                 sync_kv.push_update(DOC_NAME, &event.update).unwrap();
-                sync_kv
-                    .flush_doc_with(DOC_NAME, Default::default())
-                    .unwrap();
+                // Don't flush immediately - let the persistence worker handle it
+                // This was causing excessive S3 writes on every single update
+                // sync_kv.flush_doc_with(DOC_NAME, Default::default()).unwrap();
             })
             .map_err(|_| anyhow!("Failed to subscribe to updates"))?
         };
