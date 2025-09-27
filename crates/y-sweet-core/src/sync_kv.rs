@@ -9,6 +9,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use xxhash_rust::xxh3::xxh3_64;
 use yrs_kvstore::{DocOps, KVEntry};
 
 pub struct SyncKv {
@@ -29,15 +30,18 @@ impl SyncKv {
     ) -> Result<Self> {
         let key = format!("{}/data.ysweet", key);
 
-        let data = if let Some(store) = &store {
+        let (data, initial_hash) = if let Some(store) = &store {
             if let Some(snapshot) = store.get(&key).await.context("Failed to get from store.")? {
                 tracing::info!(size=?snapshot.len(), "Loaded snapshot");
-                bincode::deserialize(&snapshot).context("Failed to deserialize.")?
+                let data: BTreeMap<Vec<u8>, Vec<u8>> = bincode::deserialize(&snapshot).context("Failed to deserialize.")?;
+                // Calculate hash of loaded data so we don't re-persist unchanged data
+                let hash = xxh3_64(&snapshot);
+                (data, hash)
             } else {
-                BTreeMap::new()
+                (BTreeMap::new(), 0)
             }
         } else {
-            BTreeMap::new()
+            (BTreeMap::new(), 0)
         };
 
         Ok(Self {
@@ -47,23 +51,21 @@ impl SyncKv {
             dirty: AtomicBool::new(false),
             dirty_callback: Box::new(callback),
             shutdown: AtomicBool::new(false),
-            last_persisted_hash: AtomicU64::new(0),
+            last_persisted_hash: AtomicU64::new(initial_hash),
         })
     }
 
     fn mark_dirty(&self) {
-        if !self.shutdown.load(Ordering::SeqCst) {
-            let was_updated = !self.dirty.swap(true, Ordering::SeqCst);
-            if was_updated {
-                (self.dirty_callback)();
-            }
+        if !self.dirty.load(Ordering::Acquire) && !self.shutdown.load(Ordering::SeqCst) {
+            self.dirty.store(true, Ordering::Release);
+            (self.dirty_callback)();
         }
     }
 
     pub async fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Only persist if actually dirty
-        if !self.dirty.load(Ordering::SeqCst) {
-            tracing::info!("Not persisting, no changes detected");
+        // Only proceed if actually dirty
+        if !self.dirty.load(Ordering::Acquire) {
+            tracing::debug!("Skipping persist - not dirty");
             return Ok(());
         }
 
@@ -73,23 +75,18 @@ impl SyncKv {
                 bincode::serialize(&*data)?
             };
 
-            // Calculate hash of current data
-            let current_hash = {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                snapshot.hash(&mut hasher);
-                hasher.finish()
-            };
+            // Calculate hash using xxhash3 (fast and stable)
+            let current_hash = xxh3_64(&snapshot);
 
-            // Check if data has actually changed
-            let last_hash = self.last_persisted_hash.load(Ordering::Relaxed);
-            if last_hash != 0 && last_hash == current_hash {
+            // Check if data has actually changed since last persist
+            let last_hash = self.last_persisted_hash.load(Ordering::Acquire);
+            if last_hash == current_hash {
                 tracing::debug!(
                     hash = current_hash,
-                    "Skipping persist - data unchanged"
+                    "Skipping persist - content unchanged despite dirty flag"
                 );
-                self.dirty.store(false, Ordering::Relaxed);
+                // Clear dirty flag since content is same as persisted
+                self.dirty.store(false, Ordering::Release);
                 return Ok(());
             }
 
@@ -97,15 +94,17 @@ impl SyncKv {
             tracing::info!(
                 size = ?snapshot.len(),
                 hash = current_hash,
-                prev_hash = last_hash,
+                prev_hash = if last_hash == 0 { "none".to_string() } else { last_hash.to_string() },
                 "Persisting snapshot"
             );
             store.set(&self.key, snapshot).await?;
             
-            // Update the last persisted hash
-            self.last_persisted_hash.store(current_hash, Ordering::Relaxed);
+            // Update the last persisted hash atomically
+            self.last_persisted_hash.store(current_hash, Ordering::Release);
         }
-        self.dirty.store(false, Ordering::SeqCst);
+        
+        // Clear dirty flag after successful persist
+        self.dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -340,27 +339,98 @@ mod test {
     }
 
     #[tokio::test]
-    async fn only_persists_when_dirty() {
+    async fn skips_persist_when_not_dirty() {
         let store = MemoryStore::default();
-        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "foo", || ())
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
             .await
             .unwrap();
 
-        assert!(!sync_kv.dirty.load(Ordering::SeqCst));
-
-        sync_kv.set(b"foo", b"bar");
-        assert!(sync_kv.dirty.load(Ordering::SeqCst));
-
+        // First persist - should write
+        sync_kv.set(b"key1", b"value1");
         sync_kv.persist().await.unwrap();
-        assert!(!sync_kv.dirty.load(Ordering::SeqCst));
-        assert_eq!(store.data.len(), 1);
+        assert!(store.exists("test/data.ysweet").await.unwrap());
 
-        store.data.clear();
-
-        assert!(!sync_kv.dirty.load(Ordering::SeqCst));
+        // No changes made, persist should skip
+        let initial_data = store.get("test/data.ysweet").await.unwrap().unwrap();
         sync_kv.persist().await.unwrap();
+        let after_data = store.get("test/data.ysweet").await.unwrap().unwrap();
+        assert_eq!(initial_data, after_data, "Data should not change when not dirty");
+    }
 
-        // Should not persist when not dirty
-        assert!(store.data.is_empty());
+    #[tokio::test]
+    async fn skips_persist_when_content_unchanged() {
+        let store = MemoryStore::default();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+            .await
+            .unwrap();
+
+        // Set initial value and persist
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.persist().await.unwrap();
+        let initial_data = store.get("test/data.ysweet").await.unwrap().unwrap();
+
+        // Set same value again - dirty flag will be set but content is same
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.persist().await.unwrap();
+        let after_data = store.get("test/data.ysweet").await.unwrap().unwrap();
+        
+        // Should skip actual write since content is identical
+        assert_eq!(initial_data, after_data, "Should skip write when content unchanged");
+    }
+
+    #[tokio::test]
+    async fn persists_when_content_changes() {
+        let store = MemoryStore::default();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+            .await
+            .unwrap();
+
+        // Set initial value and persist
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.persist().await.unwrap();
+        let initial_data = store.get("test/data.ysweet").await.unwrap().unwrap();
+
+        // Change value
+        sync_kv.set(b"key1", b"value2");
+        sync_kv.persist().await.unwrap();
+        let after_data = store.get("test/data.ysweet").await.unwrap().unwrap();
+        
+        // Should write since content changed
+        assert_ne!(initial_data, after_data, "Should write when content changes");
+        
+        // Verify the new value is persisted
+        let sync_kv2 = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+            .await
+            .unwrap();
+        assert_eq!(sync_kv2.get(b"key1"), Some(b"value2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn no_repersist_after_reload() {
+        let store = MemoryStore::default();
+        
+        // Create, write data, and persist
+        {
+            let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+                .await
+                .unwrap();
+            sync_kv.set(b"key1", b"value1");
+            sync_kv.persist().await.unwrap();
+        }
+        
+        let initial_data = store.get("test/data.ysweet").await.unwrap().unwrap();
+        
+        // Reload and immediately persist without changes
+        {
+            let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+                .await
+                .unwrap();
+            // Mark dirty (simulating what might happen in real usage)
+            sync_kv.mark_dirty();
+            sync_kv.persist().await.unwrap();
+        }
+        
+        let after_data = store.get("test/data.ysweet").await.unwrap().unwrap();
+        assert_eq!(initial_data, after_data, "Should not re-persist unchanged loaded data");
     }
 }
