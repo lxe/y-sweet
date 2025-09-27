@@ -5,7 +5,7 @@ use std::{
     convert::Infallible,
     ops::Bound,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -18,6 +18,7 @@ pub struct SyncKv {
     dirty: AtomicBool,
     dirty_callback: Box<dyn Fn() + Send + Sync>,
     shutdown: AtomicBool,
+    last_persisted_hash: AtomicU64,
 }
 
 impl SyncKv {
@@ -46,6 +47,7 @@ impl SyncKv {
             dirty: AtomicBool::new(false),
             dirty_callback: Box::new(callback),
             shutdown: AtomicBool::new(false),
+            last_persisted_hash: AtomicU64::new(0),
         })
     }
 
@@ -71,8 +73,37 @@ impl SyncKv {
                 bincode::serialize(&*data)?
             };
 
-            tracing::info!(size=?snapshot.len(), "Persisting snapshot");
+            // Calculate hash of current data
+            let current_hash = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                snapshot.hash(&mut hasher);
+                hasher.finish()
+            };
+
+            // Check if data has actually changed
+            let last_hash = self.last_persisted_hash.load(Ordering::Relaxed);
+            if last_hash != 0 && last_hash == current_hash {
+                tracing::debug!(
+                    hash = current_hash,
+                    "Skipping persist - data unchanged"
+                );
+                self.dirty.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+
+            // Data has changed, persist it
+            tracing::info!(
+                size = ?snapshot.len(),
+                hash = current_hash,
+                prev_hash = last_hash,
+                "Persisting snapshot"
+            );
             store.set(&self.key, snapshot).await?;
+            
+            // Update the last persisted hash
+            self.last_persisted_hash.store(current_hash, Ordering::Relaxed);
         }
         self.dirty.store(false, Ordering::SeqCst);
         Ok(())
