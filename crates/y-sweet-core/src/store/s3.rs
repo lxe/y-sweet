@@ -77,7 +77,25 @@ impl S3Store {
                 self.config.token.clone(),
                 None,
                 "y-sweet",
-            ));
+            ))
+            // Configure timeouts for better connection reuse
+            .timeout_config(
+                aws_config::timeout::TimeoutConfig::builder()
+                    .connect_timeout(std::time::Duration::from_secs(3))
+                    .operation_timeout(std::time::Duration::from_secs(60))
+                    .build()
+            )
+            // Enable stalled stream protection
+            .stalled_stream_protection(
+                aws_config::stalled_stream_protection::StalledStreamProtectionConfig::enabled()
+                    .grace_period(std::time::Duration::from_secs(5))
+                    .build()
+            )
+            // Retry configuration for resilience
+            .retry_config(
+                aws_config::retry::RetryConfig::standard()
+                    .with_max_attempts(3)
+            );
 
         if !self.config.endpoint.is_empty() && self.config.endpoint != "https://s3.amazonaws.com" {
             aws_config_builder = aws_config_builder.endpoint_url(&self.config.endpoint);
