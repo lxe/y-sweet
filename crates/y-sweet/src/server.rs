@@ -36,13 +36,12 @@ use y_sweet_core::{
         NewDocResponse,
     },
     auth::{Authenticator, ExpirationTimeEpochMillis, DEFAULT_EXPIRATION_SECONDS},
-    doc_connection::{DocConnection, DOC_NAME},
+    doc_connection::DocConnection,
     doc_sync::DocWithSyncKv,
     store::Store,
     sync::awareness::Awareness,
     sync_kv::SyncKv,
 };
-use yrs_kvstore::DocOps;
 
 const PLANE_VERIFIED_USER_DATA_HEADER: &str = "x-verified-user-data";
 
@@ -276,11 +275,6 @@ impl Server {
                 }
             }
             tracing::info!("Persisting.");
-            // First flush any pending doc updates
-            if let Err(e) = sync_kv.flush_doc_with(DOC_NAME, Default::default()) {
-                tracing::error!(?e, "Error flushing doc updates.");
-            }
-            // Then persist to S3
             if let Err(e) = sync_kv.persist().await {
                 tracing::error!(?e, "Error persisting.");
             } else {
