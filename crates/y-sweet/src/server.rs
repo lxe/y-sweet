@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use axum_extra::typed_header::TypedHeader;
-use dashmap::{mapref::one::MappedRef, DashMap};
+use dashmap::{mapref::{entry::Entry, one::MappedRef}, DashMap};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -139,6 +139,10 @@ impl Server {
     }
 
     pub async fn load_doc(&self, doc_id: &str) -> Result<()> {
+        if self.docs.contains_key(doc_id) {
+            return Ok(());
+        }
+
         let (send, recv) = channel(1024);
 
         let dwskv = DocWithSyncKv::new(doc_id, self.store.clone(), move || {
@@ -152,38 +156,44 @@ impl Server {
             .await
             .map_err(|e| anyhow!("Error persisting: {:?}", e))?;
 
-        {
-            let sync_kv = dwskv.sync_kv();
-            let checkpoint_freq = self.checkpoint_freq;
-            let doc_id = doc_id.to_string();
-            let cancellation_token = self.cancellation_token.clone();
+        match self.docs.entry(doc_id.to_string()) {
+            Entry::Occupied(_) => {
+                tracing::info!(doc_id=?doc_id, "Document already loaded by another task, skipping worker spawn");
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(dwskv);
+                
+                let sync_kv = self.docs.get(doc_id).unwrap().sync_kv();
+                let checkpoint_freq = self.checkpoint_freq;
+                let doc_id = doc_id.to_string();
+                let cancellation_token = self.cancellation_token.clone();
 
-            // Spawn a task to save the document to the store when it changes.
-            self.doc_worker_tracker.spawn(
-                Self::doc_persistence_worker(
-                    recv,
-                    sync_kv,
-                    checkpoint_freq,
-                    doc_id.clone(),
-                    cancellation_token.clone(),
-                )
-                .instrument(span!(Level::INFO, "save_loop", doc_id=?doc_id)),
-            );
-
-            if self.doc_gc {
+                // Spawn a task to save the document to the store when it changes.
                 self.doc_worker_tracker.spawn(
-                    Self::doc_gc_worker(
-                        self.docs.clone(),
-                        doc_id.clone(),
+                    Self::doc_persistence_worker(
+                        recv,
+                        sync_kv,
                         checkpoint_freq,
-                        cancellation_token,
+                        doc_id.clone(),
+                        cancellation_token.clone(),
                     )
-                    .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
+                    .instrument(span!(Level::INFO, "save_loop", doc_id=?doc_id)),
                 );
+
+                if self.doc_gc {
+                    self.doc_worker_tracker.spawn(
+                        Self::doc_gc_worker(
+                            self.docs.clone(),
+                            doc_id.clone(),
+                            checkpoint_freq,
+                            cancellation_token,
+                        )
+                        .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
+                    );
+                }
             }
         }
 
-        self.docs.insert(doc_id.to_string(), dwskv);
         Ok(())
     }
 
@@ -897,5 +907,45 @@ mod test {
         assert_eq!(token.url, expected_url);
         assert_eq!(token.doc_id, doc_id);
         assert!(token.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_load_doc_prevents_duplicate_workers() {
+        let server = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                None,
+                None,
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let doc_id = "test-concurrent-doc";
+        
+        let tasks: Vec<_> = (0..10)
+            .map(|i| {
+                let server = server.clone();
+                let doc_id = doc_id.to_string();
+                tokio::spawn(async move {
+                    tracing::info!("Task {} starting load_doc", i);
+                    server.load_doc(&doc_id).await
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = futures::future::join_all(tasks).await;
+        
+        for (i, result) in results.into_iter().enumerate() {
+            assert!(result.is_ok(), "Task {} failed to join", i);
+            assert!(result.unwrap().is_ok(), "Task {} load_doc failed", i);
+        }
+
+        assert!(server.docs.contains_key(doc_id));
+        let _doc = server.get_or_create_doc(doc_id).await.unwrap();
     }
 }
