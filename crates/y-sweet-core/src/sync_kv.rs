@@ -12,6 +12,23 @@ use std::{
 use xxhash_rust::xxh3::xxh3_64;
 use yrs_kvstore::{DocOps, KVEntry};
 
+#[derive(Clone, Debug)]
+pub struct SnapshotConfig {
+    pub enabled: bool,
+    pub interval_seconds: Option<u64>,  // None = manual only
+    pub max_snapshots: Option<usize>,   // None = unlimited
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: None,
+            max_snapshots: None,
+        }
+    }
+}
+
 pub struct SyncKv {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     store: Option<Arc<Box<dyn Store>>>,
@@ -20,6 +37,8 @@ pub struct SyncKv {
     dirty_callback: Box<dyn Fn() + Send + Sync>,
     shutdown: AtomicBool,
     last_persisted_hash: AtomicU64,
+    snapshot_config: SnapshotConfig,
+    last_snapshot_time: AtomicU64,
 }
 
 impl SyncKv {
@@ -27,6 +46,15 @@ impl SyncKv {
         store: Option<Arc<Box<dyn Store>>>,
         key: &str,
         callback: Callback,
+    ) -> Result<Self> {
+        Self::new_with_snapshot_config(store, key, callback, SnapshotConfig::default()).await
+    }
+
+    pub async fn new_with_snapshot_config<Callback: Fn() + Send + Sync + 'static>(
+        store: Option<Arc<Box<dyn Store>>>,
+        key: &str,
+        callback: Callback,
+        snapshot_config: SnapshotConfig,
     ) -> Result<Self> {
         let key = format!("{}/data.ysweet", key);
 
@@ -52,6 +80,8 @@ impl SyncKv {
             dirty_callback: Box::new(callback),
             shutdown: AtomicBool::new(false),
             last_persisted_hash: AtomicU64::new(initial_hash),
+            snapshot_config,
+            last_snapshot_time: AtomicU64::new(0),
         })
     }
 
@@ -101,6 +131,18 @@ impl SyncKv {
             
             // Update the last persisted hash atomically
             self.last_persisted_hash.store(current_hash, Ordering::Release);
+
+            // Check if we should create a snapshot
+            if self.should_create_snapshot() {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                    
+                if let Err(e) = self.create_snapshot_internal(timestamp).await {
+                    tracing::error!(?e, "Failed to create automatic snapshot");
+                }
+            }
         }
         
         // Clear dirty flag after successful persist
@@ -137,6 +179,111 @@ impl SyncKv {
         self.shutdown.store(true, Ordering::SeqCst);
         // Call the callback one last time to wake up the persistence worker
         (self.dirty_callback)();
+    }
+
+    fn should_create_snapshot(&self) -> bool {
+        if !self.snapshot_config.enabled {
+            return false;
+        }
+        
+        if let Some(interval) = self.snapshot_config.interval_seconds {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let last_snapshot = self.last_snapshot_time.load(Ordering::Acquire);
+            
+            now - last_snapshot >= interval
+        } else {
+            false // Manual only
+        }
+    }
+
+    async fn create_snapshot_internal(&self, timestamp: u64) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(store) = &self.store {
+            store.create_snapshot(&self.key, timestamp).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            self.last_snapshot_time.store(timestamp, Ordering::Release);
+            
+            // Clean up old snapshots if needed
+            if let Some(max_snapshots) = self.snapshot_config.max_snapshots {
+                if let Err(e) = self.cleanup_old_snapshots(max_snapshots).await {
+                    tracing::error!(?e, "Failed to cleanup old snapshots");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_old_snapshots(&self, max_snapshots: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(store) = &self.store {
+            let snapshots = store.list_snapshots(&self.key).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            
+            // If we have more than max_snapshots, delete the oldest ones
+            if snapshots.len() > max_snapshots {
+                let to_delete = snapshots.len() - max_snapshots;
+                for snapshot in snapshots.iter().take(to_delete) {
+                    tracing::info!(timestamp = snapshot.timestamp, "Deleting old snapshot");
+                    store.delete_snapshot(&self.key, snapshot.timestamp).await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a snapshot manually. Returns the timestamp of the created snapshot.
+    pub async fn create_snapshot(&self, timestamp: Option<u64>) -> Result<u64, Box<dyn std::error::Error>> {
+        let timestamp = timestamp.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+        
+        self.create_snapshot_internal(timestamp).await?;
+        Ok(timestamp)
+    }
+
+    /// Restore the document from a snapshot at the given timestamp.
+    /// This only restores the underlying storage - to properly sync with connected clients,
+    /// use DocWithSyncKv::restore_from_snapshot which computes and broadcasts the diff.
+    pub async fn restore_from_snapshot_storage(&self, timestamp: u64) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(store) = &self.store {
+            store.restore_from_snapshot(&self.key, timestamp).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            
+            // Reload data from restored snapshot into memory
+            if let Some(snapshot) = store.get(&self.key).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)? {
+                let data: BTreeMap<Vec<u8>, Vec<u8>> = bincode::deserialize(&snapshot)?;
+                let hash = xxh3_64(&snapshot);
+                
+                *self.data.lock().unwrap() = data;
+                self.last_persisted_hash.store(hash, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+
+    /// List all available snapshots for this document.
+    pub async fn list_snapshots(&self) -> Result<Vec<crate::store::SnapshotInfo>, Box<dyn std::error::Error>> {
+        if let Some(store) = &self.store {
+            Ok(store.list_snapshots(&self.key).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Delete a specific snapshot.
+    pub async fn delete_snapshot(&self, timestamp: u64) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(store) = &self.store {
+            store.delete_snapshot(&self.key, timestamp).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        }
+        Ok(())
     }
 }
 
@@ -234,7 +381,7 @@ impl<'a> yrs_kvstore::KVStore<'a> for SyncKv {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::store::Result;
+    use crate::store::{Result, StoreError};
     use async_trait::async_trait;
     use dashmap::DashMap;
     use std::sync::atomic::AtomicUsize;
@@ -268,6 +415,49 @@ mod test {
 
         async fn exists(&self, key: &str) -> Result<bool> {
             Ok(self.data.contains_key(key))
+        }
+
+        async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
+            if let Some(data) = self.get(key).await? {
+                let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+                self.set(&snapshot_key, data).await?;
+            }
+            Ok(())
+        }
+
+        async fn list_snapshots(&self, key: &str) -> Result<Vec<crate::store::SnapshotInfo>> {
+            let prefix = format!("{}.snapshot.", key);
+            let mut snapshots = Vec::new();
+            
+            for entry in self.data.iter() {
+                if let Some(timestamp_str) = entry.key().strip_prefix(&prefix) {
+                    if let Ok(timestamp) = timestamp_str.parse::<u64>() {
+                        snapshots.push(crate::store::SnapshotInfo {
+                            timestamp,
+                            size: entry.value().len(),
+                            hash: 0,
+                        });
+                    }
+                }
+            }
+            
+            snapshots.sort_by_key(|s| s.timestamp);
+            Ok(snapshots)
+        }
+
+        async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
+            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            if let Some(snapshot_data) = self.get(&snapshot_key).await? {
+                self.set(key, snapshot_data).await?;
+            } else {
+                return Err(StoreError::DoesNotExist(format!("Snapshot {} not found", timestamp)));
+            }
+            Ok(())
+        }
+
+        async fn delete_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
+            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            self.remove(&snapshot_key).await
         }
     }
 
@@ -403,6 +593,215 @@ mod test {
             .await
             .unwrap();
         assert_eq!(sync_kv2.get(b"key1"), Some(b"value2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_manual_snapshot_creation() {
+        let store = MemoryStore::default();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+            .await
+            .unwrap();
+
+        // Set some data and persist
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.persist().await.unwrap();
+
+        // Create a manual snapshot
+        let timestamp = sync_kv.create_snapshot(Some(1000)).await.unwrap();
+        assert_eq!(timestamp, 1000);
+
+        // Verify snapshot exists
+        let snapshots = sync_kv.list_snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].timestamp, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_restore_storage() {
+        let store = MemoryStore::default();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+            .await
+            .unwrap();
+
+        // Set initial data and persist
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.persist().await.unwrap();
+
+        // Create snapshot
+        sync_kv.create_snapshot(Some(1000)).await.unwrap();
+
+        // Modify data
+        sync_kv.set(b"key1", b"value2");
+        sync_kv.set(b"key2", b"value3");
+        sync_kv.persist().await.unwrap();
+
+        // Verify current state
+        assert_eq!(sync_kv.get(b"key1"), Some(b"value2".to_vec()));
+        assert_eq!(sync_kv.get(b"key2"), Some(b"value3".to_vec()));
+
+        // Restore from snapshot at storage level
+        sync_kv.restore_from_snapshot_storage(1000).await.unwrap();
+
+        // Verify restored state
+        assert_eq!(sync_kv.get(b"key1"), Some(b"value1".to_vec()));
+        assert_eq!(sync_kv.get(b"key2"), None);
+    }
+
+    #[tokio::test]
+    async fn test_list_snapshots_ordered() {
+        let store = MemoryStore::default();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+            .await
+            .unwrap();
+
+        // Set some data
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.persist().await.unwrap();
+
+        // Create multiple snapshots in non-sequential order
+        sync_kv.create_snapshot(Some(3000)).await.unwrap();
+        sync_kv.create_snapshot(Some(1000)).await.unwrap();
+        sync_kv.create_snapshot(Some(2000)).await.unwrap();
+
+        // List snapshots should be ordered
+        let snapshots = sync_kv.list_snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].timestamp, 1000);
+        assert_eq!(snapshots[1].timestamp, 2000);
+        assert_eq!(snapshots[2].timestamp, 3000);
+    }
+
+    #[tokio::test]
+    async fn test_delete_snapshot() {
+        let store = MemoryStore::default();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+            .await
+            .unwrap();
+
+        // Set some data
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.persist().await.unwrap();
+
+        // Create snapshots
+        sync_kv.create_snapshot(Some(1000)).await.unwrap();
+        sync_kv.create_snapshot(Some(2000)).await.unwrap();
+        sync_kv.create_snapshot(Some(3000)).await.unwrap();
+
+        // Verify 3 snapshots exist
+        let snapshots = sync_kv.list_snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 3);
+
+        // Delete middle snapshot
+        sync_kv.delete_snapshot(2000).await.unwrap();
+
+        // Verify only 2 snapshots remain
+        let snapshots = sync_kv.list_snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].timestamp, 1000);
+        assert_eq!(snapshots[1].timestamp, 3000);
+    }
+
+    #[tokio::test]
+    async fn test_automatic_snapshot_with_interval() {
+        let store = MemoryStore::default();
+        let snapshot_config = SnapshotConfig {
+            enabled: true,
+            interval_seconds: Some(1), // 1 second interval
+            max_snapshots: None,
+        };
+        
+        let sync_kv = SyncKv::new_with_snapshot_config(
+            Some(Arc::new(Box::new(store.clone()))),
+            "test",
+            || (),
+            snapshot_config,
+        )
+        .await
+        .unwrap();
+
+        // Set data and persist (should create first snapshot)
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.persist().await.unwrap();
+
+        // Wait for interval to pass
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Modify and persist again (should create second snapshot)
+        sync_kv.set(b"key2", b"value2");
+        sync_kv.persist().await.unwrap();
+
+        // Verify snapshots were created automatically
+        let snapshots = sync_kv.list_snapshots().await.unwrap();
+        assert!(snapshots.len() >= 1, "At least one snapshot should be created");
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_max_retention() {
+        let store = MemoryStore::default();
+        let snapshot_config = SnapshotConfig {
+            enabled: true,
+            interval_seconds: None, // Manual only
+            max_snapshots: Some(3),
+        };
+        
+        let sync_kv = SyncKv::new_with_snapshot_config(
+            Some(Arc::new(Box::new(store.clone()))),
+            "test",
+            || (),
+            snapshot_config,
+        )
+        .await
+        .unwrap();
+
+        // Set some data
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.persist().await.unwrap();
+
+        // Create 5 snapshots
+        for i in 1..=5 {
+            sync_kv.create_snapshot(Some(i * 1000)).await.unwrap();
+        }
+
+        // Should only have 3 snapshots (oldest deleted)
+        let snapshots = sync_kv.list_snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].timestamp, 3000);
+        assert_eq!(snapshots[1].timestamp, 4000);
+        assert_eq!(snapshots[2].timestamp, 5000);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_with_empty_document() {
+        let store = MemoryStore::default();
+        let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
+            .await
+            .unwrap();
+
+        // Set initial data to have something to snapshot
+        sync_kv.set(b"initial", b"data");
+        sync_kv.persist().await.unwrap();
+
+        // Create snapshot
+        sync_kv.create_snapshot(Some(1000)).await.unwrap();
+
+        // Verify snapshot exists
+        let snapshots = sync_kv.list_snapshots().await.unwrap();
+        assert_eq!(snapshots.len(), 1);
+
+        // Modify document - add more data
+        sync_kv.set(b"key1", b"value1");
+        sync_kv.set(b"key2", b"value2");
+        sync_kv.persist().await.unwrap();
+
+        // Verify new state
+        assert_eq!(sync_kv.get(b"key1"), Some(b"value1".to_vec()));
+        assert_eq!(sync_kv.get(b"key2"), Some(b"value2".to_vec()));
+
+        // Restore to initial state (with only "initial" key) at storage level
+        sync_kv.restore_from_snapshot_storage(1000).await.unwrap();
+        assert_eq!(sync_kv.get(b"initial"), Some(b"data".to_vec()));
+        assert_eq!(sync_kv.get(b"key1"), None);
+        assert_eq!(sync_kv.get(b"key2"), None);
     }
 
     #[tokio::test]

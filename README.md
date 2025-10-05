@@ -13,6 +13,7 @@
 - Scales horizontally with a [session backend](https://jamsocket.com/blog/session-backends) model.
 - Deploys as a native Linux process.
 - Provides document-level access control via client tokens.
+- Supports versioned snapshots for point-in-time document recovery.
 - Written in Rust with a focus on stability and performance.
 
 ## Y-Sweet stack
@@ -45,6 +46,7 @@ For more information, check out our [documentation](https://docs.jamsocket.com/y
     - [Document management SDK](https://docs.jamsocket.com/y-sweet/reference/sdk)
 - [Y-Sweet on Jamsocket (managed service) docs](https://docs.jamsocket.com/y-sweet/quickstart)
 - [Self Hosting and Running Locally](https://github.com/jamsocket/y-sweet/blob/main/docs/running.md)
+- [Snapshots and Point-in-Time Recovery](https://github.com/jamsocket/y-sweet/blob/main/docs/running.md#snapshots)
 
 ## Examples
 

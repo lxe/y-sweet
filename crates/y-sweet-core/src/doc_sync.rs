@@ -1,4 +1,4 @@
-use crate::{doc_connection::DOC_NAME, store::Store, sync::awareness::Awareness, sync_kv::SyncKv};
+use crate::{doc_connection::DOC_NAME, store::Store, sync::awareness::Awareness, sync_kv::{SyncKv, SnapshotConfig}};
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Arc, RwLock};
 use yrs::{updates::decoder::Decode, Doc, ReadTxn, StateVector, Subscription, Transact, Update};
@@ -28,7 +28,19 @@ impl DocWithSyncKv {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        let sync_kv = SyncKv::new(store, key, dirty_callback)
+        Self::new_with_snapshot_config(key, store, dirty_callback, SnapshotConfig::default()).await
+    }
+
+    pub async fn new_with_snapshot_config<F>(
+        key: &str,
+        store: Option<Arc<Box<dyn Store>>>,
+        dirty_callback: F,
+        snapshot_config: SnapshotConfig,
+    ) -> Result<Self>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let sync_kv = SyncKv::new_with_snapshot_config(store, key, dirty_callback, snapshot_config)
             .await
             .context("Failed to create SyncKv")?;
 
@@ -81,5 +93,168 @@ impl DocWithSyncKv {
         txn.apply_update(update);
 
         Ok(())
+    }
+
+    /// Restore the document from a snapshot at the given timestamp.
+    /// This restores the snapshot and **disconnects all clients**, requiring them to reconnect
+    /// to receive the restored state. Yjs CRDTs merge updates rather than replacing state,
+    /// so a full document replacement is necessary for proper snapshot restoration.
+    pub async fn restore_from_snapshot(&self, timestamp: u64) -> Result<()> {
+        // Restore the snapshot in storage
+        self.sync_kv.restore_from_snapshot_storage(timestamp).await
+            .map_err(|e| anyhow!("Failed to restore snapshot storage: {}", e))?;
+
+        // Note: After restoration, clients should reconnect to receive the restored state.
+        // The server implementation should close WebSocket connections for this document
+        // after calling this method to force clients to reconnect and sync the restored state.
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Result as StoreResult, StoreError, SnapshotInfo};
+    use async_trait::async_trait;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use yrs::{Map, Transact, WriteTxn};
+
+    #[derive(Default, Clone)]
+    struct MemoryStore {
+        data: Arc<DashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl Store for MemoryStore {
+        async fn init(&self) -> StoreResult<()> {
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> StoreResult<Option<Vec<u8>>> {
+            Ok(self.data.get(key).map(|v| v.clone()))
+        }
+
+        async fn set(&self, key: &str, value: Vec<u8>) -> StoreResult<()> {
+            self.data.insert(key.to_string(), value);
+            Ok(())
+        }
+
+        async fn remove(&self, key: &str) -> StoreResult<()> {
+            self.data.remove(key);
+            Ok(())
+        }
+
+        async fn exists(&self, key: &str) -> StoreResult<bool> {
+            Ok(self.data.contains_key(key))
+        }
+
+        async fn create_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
+            if let Some(data) = self.get(key).await? {
+                let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+                self.set(&snapshot_key, data).await?;
+            }
+            Ok(())
+        }
+
+        async fn list_snapshots(&self, key: &str) -> StoreResult<Vec<SnapshotInfo>> {
+            let prefix = format!("{}.snapshot.", key);
+            let mut snapshots = Vec::new();
+            
+            for entry in self.data.iter() {
+                if let Some(timestamp_str) = entry.key().strip_prefix(&prefix) {
+                    if let Ok(timestamp) = timestamp_str.parse::<u64>() {
+                        snapshots.push(SnapshotInfo {
+                            timestamp,
+                            size: entry.value().len(),
+                            hash: 0,
+                        });
+                    }
+                }
+            }
+            
+            snapshots.sort_by_key(|s| s.timestamp);
+            Ok(snapshots)
+        }
+
+        async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
+            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            if let Some(snapshot_data) = self.get(&snapshot_key).await? {
+                self.set(key, snapshot_data).await?;
+            } else {
+                return Err(StoreError::DoesNotExist(format!("Snapshot {} not found", timestamp)));
+            }
+            Ok(())
+        }
+
+        async fn delete_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
+            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            self.remove(&snapshot_key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_restore_and_reload() {
+        let store = MemoryStore::default();
+        let doc_with_kv = DocWithSyncKv::new("test", Some(Arc::new(Box::new(store.clone()))), || ())
+            .await
+            .unwrap();
+
+        // Set initial data using Yjs
+        {
+            let awareness = doc_with_kv.awareness();
+            let awareness_guard = awareness.read().unwrap();
+            let mut txn = awareness_guard.doc.transact_mut();
+            let map = txn.get_or_insert_map("data");
+            map.insert(&mut txn, "key1", "value1");
+        }
+
+        // Persist and create snapshot
+        doc_with_kv.sync_kv().persist().await.unwrap();
+        doc_with_kv.sync_kv().create_snapshot(Some(1000)).await.unwrap();
+
+        // Modify data
+        {
+            let awareness = doc_with_kv.awareness();
+            let awareness_guard = awareness.read().unwrap();
+            let mut txn = awareness_guard.doc.transact_mut();
+            let map = txn.get_or_insert_map("data");
+            map.insert(&mut txn, "key1", "value2");
+            map.insert(&mut txn, "key2", "value3");
+        }
+
+        // Persist changes
+        doc_with_kv.sync_kv().persist().await.unwrap();
+
+        // Verify current state
+        {
+            let awareness = doc_with_kv.awareness();
+            let awareness_guard = awareness.read().unwrap();
+            let txn = awareness_guard.doc.transact();
+            let map = txn.get_map("data").unwrap();
+            assert_eq!(map.get(&txn, "key1").unwrap().to_string(&txn), "value2");
+            assert_eq!(map.get(&txn, "key2").unwrap().to_string(&txn), "value3");
+        }
+
+        // Restore from snapshot
+        doc_with_kv.restore_from_snapshot(1000).await.unwrap();
+
+        // In a real scenario, clients would be disconnected here and would reconnect.
+        // Simulate this by creating a new DocWithSyncKv instance
+        drop(doc_with_kv);
+        let reloaded_doc = DocWithSyncKv::new("test", Some(Arc::new(Box::new(store.clone()))), || ())
+            .await
+            .unwrap();
+
+        // Verify restored state after reconnection
+        {
+            let awareness = reloaded_doc.awareness();
+            let awareness_guard = awareness.read().unwrap();
+            let txn = awareness_guard.doc.transact();
+            let map = txn.get_map("data").unwrap();
+            assert_eq!(map.get(&txn, "key1").unwrap().to_string(&txn), "value1");
+            assert!(map.get(&txn, "key2").is_none());
+        }
     }
 }

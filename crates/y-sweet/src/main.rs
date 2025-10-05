@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
+use y_sweet_core::sync_kv::SnapshotConfig;
 use y_sweet::cli::{print_auth_message, print_server_url};
 use y_sweet::stores::filesystem::FileSystemStore;
 use y_sweet_core::{
@@ -56,6 +57,15 @@ enum ServSubcommand {
 
         #[clap(long, env = "Y_SWEET_MAX_BODY_SIZE")]
         max_body_size: Option<usize>,
+
+        #[clap(long, env = "Y_SWEET_SNAPSHOT_ENABLE")]
+        snapshot_enable: bool,
+
+        #[clap(long, env = "Y_SWEET_SNAPSHOT_INTERVAL_SECONDS")]
+        snapshot_interval_seconds: Option<u64>,
+
+        #[clap(long, env = "Y_SWEET_SNAPSHOT_MAX_SNAPSHOTS")]
+        snapshot_max_snapshots: Option<usize>,
     },
 
     GenAuth {
@@ -176,6 +186,9 @@ async fn main() -> Result<()> {
             url_prefix,
             prod,
             max_body_size,
+            snapshot_enable,
+            snapshot_interval_seconds,
+            snapshot_max_snapshots,
         } => {
             let auth = if let Some(auth) = auth {
                 Some(Authenticator::new(auth)?)
@@ -207,6 +220,12 @@ async fn main() -> Result<()> {
 
             let token = CancellationToken::new();
 
+            let snapshot_config = SnapshotConfig {
+                enabled: *snapshot_enable,
+                interval_seconds: *snapshot_interval_seconds,
+                max_snapshots: *snapshot_max_snapshots,
+            };
+
             let server = y_sweet::server::Server::new(
                 store,
                 std::time::Duration::from_secs(*checkpoint_freq_seconds),
@@ -215,6 +234,7 @@ async fn main() -> Result<()> {
                 token.clone(),
                 true,
                 *max_body_size,
+                snapshot_config,
             )
             .await?;
 
@@ -305,6 +325,7 @@ async fn main() -> Result<()> {
             };
 
             let cancellation_token = CancellationToken::new();
+            let snapshot_config = SnapshotConfig::default();
             let server = y_sweet::server::Server::new(
                 store,
                 std::time::Duration::from_secs(*checkpoint_freq_seconds),
@@ -313,6 +334,7 @@ async fn main() -> Result<()> {
                 cancellation_token.clone(),
                 false,
                 *max_body_size,
+                snapshot_config,
             )
             .await?;
 

@@ -1,4 +1,4 @@
-use super::{Result, StoreError};
+use super::{Result, StoreError, SnapshotInfo};
 use crate::store::Store;
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -324,6 +324,98 @@ impl S3Store {
             }
         }
     }
+
+    fn snapshot_key(&self, base_key: &str, timestamp: u64) -> String {
+        base_key.replace("/data.ysweet", &format!("/snapshots/snapshot.{}.ysweet", timestamp))
+    }
+
+    fn snapshots_prefix(&self, base_key: &str) -> String {
+        base_key.replace("/data.ysweet", "/snapshots/")
+    }
+
+    fn extract_timestamp_from_key(&self, key: &str) -> Option<u64> {
+        // Extract timestamp from "prefix/snapshots/snapshot.1234567890.ysweet"
+        if let Some(filename) = key.split('/').last() {
+            if let Some(timestamp_str) = filename.strip_prefix("snapshot.").and_then(|s| s.strip_suffix(".ysweet")) {
+                timestamp_str.parse().ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    async fn create_snapshot_impl(&self, key: &str, timestamp: u64) -> Result<()> {
+        // Copy current document to snapshot location
+        if let Some(data) = self.get(key).await? {
+            let snapshot_key = self.snapshot_key(key, timestamp);
+            tracing::info!(key = %key, snapshot_key = %snapshot_key, timestamp = timestamp, "Creating snapshot");
+            self.set(&snapshot_key, data).await?;
+        }
+        Ok(())
+    }
+
+    async fn list_snapshots_impl(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
+        let prefix = self.prefixed_key(&self.snapshots_prefix(key));
+        let client = self.get_client().await?;
+        
+        let mut snapshots = Vec::new();
+        let mut continuation_token = None;
+        
+        loop {
+            let mut request = client.list_objects_v2()
+                .bucket(&self.config.bucket)
+                .prefix(&prefix);
+                
+            if let Some(token) = continuation_token {
+                request = request.continuation_token(token);
+            }
+            
+            let response = request.send().await
+                .map_err(|e| StoreError::ConnectionError(format!("Failed to list snapshots: {}", e)))?;
+            
+            if let Some(contents) = response.contents {
+                for object in contents {
+                    if let (Some(obj_key), Some(size)) = (object.key, object.size) {
+                        if let Some(timestamp) = self.extract_timestamp_from_key(&obj_key) {
+                            snapshots.push(SnapshotInfo {
+                                timestamp,
+                                size: size as usize,
+                                hash: 0, // Could calculate if needed
+                            });
+                        }
+                    }
+                }
+            }
+            
+            if response.is_truncated == Some(true) {
+                continuation_token = response.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+        
+        snapshots.sort_by_key(|s| s.timestamp);
+        Ok(snapshots)
+    }
+
+    async fn restore_from_snapshot_impl(&self, key: &str, timestamp: u64) -> Result<()> {
+        let snapshot_key = self.snapshot_key(key, timestamp);
+        tracing::info!(key = %key, snapshot_key = %snapshot_key, timestamp = timestamp, "Restoring from snapshot");
+        if let Some(snapshot_data) = self.get(&snapshot_key).await? {
+            self.set(key, snapshot_data).await?;
+        } else {
+            return Err(StoreError::DoesNotExist(format!("Snapshot {} not found", timestamp)));
+        }
+        Ok(())
+    }
+
+    async fn delete_snapshot_impl(&self, key: &str, timestamp: u64) -> Result<()> {
+        let snapshot_key = self.snapshot_key(key, timestamp);
+        tracing::info!(key = %key, snapshot_key = %snapshot_key, timestamp = timestamp, "Deleting snapshot");
+        self.remove(&snapshot_key).await
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -348,6 +440,22 @@ impl Store for S3Store {
     async fn exists(&self, key: &str) -> Result<bool> {
         self.exists(key).await
     }
+
+    async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
+        self.create_snapshot_impl(key, timestamp).await
+    }
+
+    async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
+        self.list_snapshots_impl(key).await
+    }
+
+    async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
+        self.restore_from_snapshot_impl(key, timestamp).await
+    }
+
+    async fn delete_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
+        self.delete_snapshot_impl(key, timestamp).await
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -371,5 +479,21 @@ impl Store for S3Store {
 
     async fn exists(&self, key: &str) -> Result<bool> {
         self.exists(key).await
+    }
+
+    async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
+        self.create_snapshot_impl(key, timestamp).await
+    }
+
+    async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
+        self.list_snapshots_impl(key).await
+    }
+
+    async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
+        self.restore_from_snapshot_impl(key, timestamp).await
+    }
+
+    async fn delete_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
+        self.delete_snapshot_impl(key, timestamp).await
     }
 }

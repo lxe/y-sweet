@@ -17,6 +17,13 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    pub timestamp: u64,
+    pub size: usize,
+    pub hash: u64,
+}
+
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait Store: 'static {
@@ -25,6 +32,12 @@ pub trait Store: 'static {
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()>;
     async fn remove(&self, key: &str) -> Result<()>;
     async fn exists(&self, key: &str) -> Result<bool>;
+    
+    // Snapshot operations
+    async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
+    async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>>;
+    async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
+    async fn delete_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -35,4 +48,10 @@ pub trait Store: Send + Sync {
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()>;
     async fn remove(&self, key: &str) -> Result<()>;
     async fn exists(&self, key: &str) -> Result<bool>;
+    
+    // Snapshot operations
+    async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
+    async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>>;
+    async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
+    async fn delete_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
 }
