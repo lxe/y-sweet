@@ -193,6 +193,12 @@ impl SyncKv {
                 .as_secs();
             let last_snapshot = self.last_snapshot_time.load(Ordering::Acquire);
             
+            // If no snapshot has been created yet (last_snapshot == 0), create the first one
+            // Otherwise, only create a snapshot if the interval has elapsed
+            if last_snapshot == 0 {
+                return true;
+            }
+            
             now - last_snapshot >= interval
         } else {
             false // Manual only
