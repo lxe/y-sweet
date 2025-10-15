@@ -92,6 +92,7 @@ pub struct Server {
     /// Disabled for single-doc mode, since we only have one doc.
     doc_gc: bool,
     max_body_size: Option<usize>,
+    max_frame_size: Option<usize>,
     snapshot_config: SnapshotConfig,
 }
 
@@ -104,6 +105,7 @@ impl Server {
         cancellation_token: CancellationToken,
         doc_gc: bool,
         max_body_size: Option<usize>,
+        max_frame_size: Option<usize>,
         snapshot_config: SnapshotConfig,
     ) -> Result<Self> {
         Ok(Self {
@@ -116,6 +118,7 @@ impl Server {
             cancellation_token,
             doc_gc,
             max_body_size,
+            max_frame_size,
             snapshot_config,
         })
     }
@@ -565,7 +568,14 @@ async fn handle_socket_upgrade(
     let awareness = dwskv.awareness();
     let cancellation_token = server_state.cancellation_token.clone();
 
-    Ok(ws.on_upgrade(move |socket| {
+    let mut ws_upgrade = ws;
+    
+    // Configure max frame size if specified
+    if let Some(max_frame_size) = server_state.max_frame_size {
+        ws_upgrade = ws_upgrade.max_frame_size(max_frame_size);
+    }
+
+    Ok(ws_upgrade.on_upgrade(move |socket| {
         handle_socket(socket, awareness, authorization, cancellation_token)
     }))
 }
@@ -972,6 +982,7 @@ mod test {
             CancellationToken::new(),
             true,
             None,
+            None,
             SnapshotConfig::default(),
         )
         .await
@@ -1012,6 +1023,7 @@ mod test {
             CancellationToken::new(),
             true,
             None,
+            None,
             SnapshotConfig::default(),
         )
         .await
@@ -1047,6 +1059,7 @@ mod test {
                 None,
                 CancellationToken::new(),
                 true,
+                None,
                 None,
                 SnapshotConfig::default(),
             )

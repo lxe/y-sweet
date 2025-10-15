@@ -58,6 +58,9 @@ enum ServSubcommand {
         #[clap(long, env = "Y_SWEET_MAX_BODY_SIZE")]
         max_body_size: Option<usize>,
 
+        #[clap(long, env = "Y_SWEET_MAX_FRAME_SIZE")]
+        max_frame_size: Option<usize>,
+
         #[clap(long, env = "Y_SWEET_SNAPSHOT_ENABLE")]
         snapshot_enable: bool,
 
@@ -98,6 +101,9 @@ enum ServSubcommand {
 
         #[clap(long, env = "Y_SWEET_MAX_BODY_SIZE")]
         max_body_size: Option<usize>,
+
+        #[clap(long, env = "Y_SWEET_MAX_FRAME_SIZE")]
+        max_frame_size: Option<usize>,
     },
 }
 
@@ -234,6 +240,7 @@ async fn main() -> Result<()> {
                 token.clone(),
                 true,
                 *max_body_size,
+                *max_frame_size,
                 snapshot_config,
             )
             .await?;
@@ -287,6 +294,7 @@ async fn main() -> Result<()> {
             host,
             checkpoint_freq_seconds,
             max_body_size,
+            max_frame_size,
         } => {
             let doc_id = env::var("SESSION_BACKEND_KEY").expect("SESSION_BACKEND_KEY must be set");
 
@@ -334,6 +342,7 @@ async fn main() -> Result<()> {
                 cancellation_token.clone(),
                 false,
                 *max_body_size,
+                *max_frame_size,
                 snapshot_config,
             )
             .await?;
