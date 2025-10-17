@@ -363,6 +363,7 @@ impl Server {
             .route("/doc/:doc_id/update", post(update_doc_deprecated))
             .route("/doc/:doc_id/snapshots", get(list_snapshots))
             .route("/doc/:doc_id/snapshots", post(create_snapshot))
+            .route("/doc/:doc_id/snapshots/:timestamp", get(get_snapshot))
             .route("/doc/:doc_id/snapshots/:timestamp", post(restore_snapshot))
             .route("/doc/:doc_id/snapshots/:timestamp", axum::routing::delete(delete_snapshot))
             .route("/d/:doc_id/as-update", get(get_doc_as_update))
@@ -895,6 +896,29 @@ async fn create_snapshot(
         Ok(Json(json!({ "timestamp": timestamp })))
     } else {
         Err((StatusCode::NOT_FOUND, anyhow!("Document not found")))?
+    }
+}
+
+async fn get_snapshot(
+    State(server_state): State<Arc<Server>>,
+    Path((doc_id, timestamp)): Path<(String, u64)>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Vec<u8>, AppError> {
+    let token = get_token_from_header(auth_header);
+    let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+
+    if let Some(store) = &server_state.store {
+        let key = format!("{}/data.ysweet", doc_id);
+        let snapshot_data = store.get_snapshot(&key, timestamp).await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to get snapshot: {}", e)))?;
+        
+        if let Some(data) = snapshot_data {
+            Ok(data)
+        } else {
+            Err((StatusCode::NOT_FOUND, anyhow!("Snapshot not found")))?
+        }
+    } else {
+        Err((StatusCode::NOT_FOUND, anyhow!("No store configured")))?
     }
 }
 

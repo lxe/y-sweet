@@ -451,6 +451,11 @@ mod test {
             Ok(snapshots)
         }
 
+        async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>> {
+            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            self.get(&snapshot_key).await
+        }
+
         async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
             let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
             if let Some(snapshot_data) = self.get(&snapshot_key).await? {

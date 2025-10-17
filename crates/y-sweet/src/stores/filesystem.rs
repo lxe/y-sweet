@@ -113,6 +113,11 @@ impl Store for FileSystemStore {
         Ok(snapshots)
     }
 
+    async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>> {
+        let snapshot_key = self.snapshot_key(key, timestamp);
+        self.get(&snapshot_key).await
+    }
+
     async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
         let snapshot_key = self.snapshot_key(key, timestamp);
         if let Some(snapshot_data) = self.get(&snapshot_key).await? {

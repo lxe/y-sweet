@@ -400,6 +400,12 @@ impl S3Store {
         Ok(snapshots)
     }
 
+    async fn get_snapshot_impl(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>> {
+        let snapshot_key = self.snapshot_key(key, timestamp);
+        tracing::info!(key = %key, snapshot_key = %snapshot_key, timestamp = timestamp, "Getting snapshot");
+        self.get(&snapshot_key).await
+    }
+
     async fn restore_from_snapshot_impl(&self, key: &str, timestamp: u64) -> Result<()> {
         let snapshot_key = self.snapshot_key(key, timestamp);
         tracing::info!(key = %key, snapshot_key = %snapshot_key, timestamp = timestamp, "Restoring from snapshot");
@@ -449,6 +455,10 @@ impl Store for S3Store {
         self.list_snapshots_impl(key).await
     }
 
+    async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>> {
+        self.get_snapshot_impl(key, timestamp).await
+    }
+
     async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
         self.restore_from_snapshot_impl(key, timestamp).await
     }
@@ -487,6 +497,10 @@ impl Store for S3Store {
 
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
         self.list_snapshots_impl(key).await
+    }
+
+    async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>> {
+        self.get_snapshot_impl(key, timestamp).await
     }
 
     async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
