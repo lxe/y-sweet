@@ -32,9 +32,10 @@ pub trait Store: 'static {
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()>;
     async fn remove(&self, key: &str) -> Result<()>;
     async fn exists(&self, key: &str) -> Result<bool>;
-    
+
     // Snapshot operations
     async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
+    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()>;
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>>;
     async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>>;
     async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
@@ -49,9 +50,10 @@ pub trait Store: Send + Sync {
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()>;
     async fn remove(&self, key: &str) -> Result<()>;
     async fn exists(&self, key: &str) -> Result<bool>;
-    
+
     // Snapshot operations
     async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
+    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()>;
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>>;
     async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>>;
     async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;

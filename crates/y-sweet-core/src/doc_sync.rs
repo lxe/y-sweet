@@ -95,6 +95,42 @@ impl DocWithSyncKv {
         Ok(())
     }
 
+    /// Create a snapshot with proper Yjs binary format.
+    /// This creates a snapshot that can be directly applied with Y.applyUpdate() on the client.
+    pub async fn create_snapshot(&self, timestamp: Option<u64>) -> Result<u64> {
+        let timestamp = timestamp.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+
+        // Get the document as a Yjs binary update
+        let yjs_data = self.as_update();
+
+        // Use the SyncKv's create_snapshot method but pass the Yjs data
+        self.sync_kv.create_snapshot_with_yjs_data(Some(timestamp), yjs_data).await
+            .map_err(|e| anyhow!("Failed to create snapshot: {}", e))?;
+
+        Ok(timestamp)
+    }
+
+    /// Check if an automatic snapshot should be created and create it if needed.
+    /// This should be called after document persistence.
+    pub async fn check_and_create_automatic_snapshot(&self) -> Result<()> {
+        if self.sync_kv.should_create_snapshot() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            if let Err(e) = self.create_snapshot(Some(timestamp)).await {
+                tracing::error!(?e, "Failed to create automatic snapshot");
+            }
+        }
+        Ok(())
+    }
+
     /// Restore the document from a snapshot at the given timestamp.
     /// This restores the snapshot and **disconnects all clients**, requiring them to reconnect
     /// to receive the restored state. Yjs CRDTs merge updates rather than replacing state,
@@ -158,10 +194,15 @@ mod tests {
             Ok(())
         }
 
+        async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> StoreResult<()> {
+            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            self.set(&snapshot_key, data).await
+        }
+
         async fn list_snapshots(&self, key: &str) -> StoreResult<Vec<SnapshotInfo>> {
             let prefix = format!("{}.snapshot.", key);
             let mut snapshots = Vec::new();
-            
+
             for entry in self.data.iter() {
                 if let Some(timestamp_str) = entry.key().strip_prefix(&prefix) {
                     if let Ok(timestamp) = timestamp_str.parse::<u64>() {
@@ -173,7 +214,7 @@ mod tests {
                     }
                 }
             }
-            
+
             snapshots.sort_by_key(|s| s.timestamp);
             Ok(snapshots)
         }

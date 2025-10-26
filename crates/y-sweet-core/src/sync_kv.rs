@@ -128,23 +128,14 @@ impl SyncKv {
                 "Persisting snapshot"
             );
             store.set(&self.key, snapshot).await?;
-            
+
             // Update the last persisted hash atomically
             self.last_persisted_hash.store(current_hash, Ordering::Release);
 
-            // Check if we should create a snapshot
-            if self.should_create_snapshot() {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                    
-                if let Err(e) = self.create_snapshot_internal(timestamp).await {
-                    tracing::error!(?e, "Failed to create automatic snapshot");
-                }
-            }
+            // Note: Automatic snapshot creation moved to DocWithSyncKv level
+            // where we have access to Yjs document for proper format conversion
         }
-        
+
         // Clear dirty flag after successful persist
         self.dirty.store(false, Ordering::Release);
         Ok(())
@@ -181,24 +172,25 @@ impl SyncKv {
         (self.dirty_callback)();
     }
 
-    fn should_create_snapshot(&self) -> bool {
+
+    pub fn should_create_snapshot(&self) -> bool {
         if !self.snapshot_config.enabled {
             return false;
         }
-        
+
         if let Some(interval) = self.snapshot_config.interval_seconds {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
             let last_snapshot = self.last_snapshot_time.load(Ordering::Acquire);
-            
+
             // If no snapshot has been created yet (last_snapshot == 0), create the first one
             // Otherwise, only create a snapshot if the interval has elapsed
             if last_snapshot == 0 {
                 return true;
             }
-            
+
             now - last_snapshot >= interval
         } else {
             false // Manual only
@@ -210,7 +202,7 @@ impl SyncKv {
             store.create_snapshot(&self.key, timestamp).await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
             self.last_snapshot_time.store(timestamp, Ordering::Release);
-            
+
             // Clean up old snapshots if needed
             if let Some(max_snapshots) = self.snapshot_config.max_snapshots {
                 if let Err(e) = self.cleanup_old_snapshots(max_snapshots).await {
@@ -225,7 +217,7 @@ impl SyncKv {
         if let Some(store) = &self.store {
             let snapshots = store.list_snapshots(&self.key).await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-            
+
             // If we have more than max_snapshots, delete the oldest ones
             if snapshots.len() > max_snapshots {
                 let to_delete = snapshots.len() - max_snapshots;
@@ -247,8 +239,33 @@ impl SyncKv {
                 .unwrap()
                 .as_secs()
         });
-        
+
         self.create_snapshot_internal(timestamp).await?;
+        Ok(timestamp)
+    }
+
+    /// Create a snapshot with provided Yjs binary data. Returns the timestamp of the created snapshot.
+    pub async fn create_snapshot_with_yjs_data(&self, timestamp: Option<u64>, yjs_data: Vec<u8>) -> Result<u64, Box<dyn std::error::Error>> {
+        let timestamp = timestamp.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+
+        if let Some(store) = &self.store {
+            store.create_snapshot_with_data(&self.key, timestamp, yjs_data).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            self.last_snapshot_time.store(timestamp, Ordering::Release);
+
+            // Clean up old snapshots if needed
+            if let Some(max_snapshots) = self.snapshot_config.max_snapshots {
+                if let Err(e) = self.cleanup_old_snapshots(max_snapshots).await {
+                    tracing::error!(?e, "Failed to cleanup old snapshots");
+                }
+            }
+        }
+
         Ok(timestamp)
     }
 
@@ -259,13 +276,13 @@ impl SyncKv {
         if let Some(store) = &self.store {
             store.restore_from_snapshot(&self.key, timestamp).await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-            
+
             // Reload data from restored snapshot into memory
             if let Some(snapshot) = store.get(&self.key).await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)? {
                 let data: BTreeMap<Vec<u8>, Vec<u8>> = bincode::deserialize(&snapshot)?;
                 let hash = xxh3_64(&snapshot);
-                
+
                 *self.data.lock().unwrap() = data;
                 self.last_persisted_hash.store(hash, Ordering::Release);
             }
@@ -434,7 +451,7 @@ mod test {
         async fn list_snapshots(&self, key: &str) -> Result<Vec<crate::store::SnapshotInfo>> {
             let prefix = format!("{}.snapshot.", key);
             let mut snapshots = Vec::new();
-            
+
             for entry in self.data.iter() {
                 if let Some(timestamp_str) = entry.key().strip_prefix(&prefix) {
                     if let Ok(timestamp) = timestamp_str.parse::<u64>() {
@@ -446,7 +463,7 @@ mod test {
                     }
                 }
             }
-            
+
             snapshots.sort_by_key(|s| s.timestamp);
             Ok(snapshots)
         }
@@ -574,7 +591,7 @@ mod test {
         sync_kv.set(b"key1", b"value1");
         sync_kv.persist().await.unwrap();
         let after_data = store.get("test/data.ysweet").await.unwrap().unwrap();
-        
+
         // Should skip actual write since content is identical
         assert_eq!(initial_data, after_data, "Should skip write when content unchanged");
     }
@@ -595,10 +612,10 @@ mod test {
         sync_kv.set(b"key1", b"value2");
         sync_kv.persist().await.unwrap();
         let after_data = store.get("test/data.ysweet").await.unwrap().unwrap();
-        
+
         // Should write since content changed
         assert_ne!(initial_data, after_data, "Should write when content changes");
-        
+
         // Verify the new value is persisted
         let sync_kv2 = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
             .await
@@ -720,7 +737,7 @@ mod test {
             interval_seconds: Some(1), // 1 second interval
             max_snapshots: None,
         };
-        
+
         let sync_kv = SyncKv::new_with_snapshot_config(
             Some(Arc::new(Box::new(store.clone()))),
             "test",
@@ -754,7 +771,7 @@ mod test {
             interval_seconds: None, // Manual only
             max_snapshots: Some(3),
         };
-        
+
         let sync_kv = SyncKv::new_with_snapshot_config(
             Some(Arc::new(Box::new(store.clone()))),
             "test",
@@ -818,7 +835,7 @@ mod test {
     #[tokio::test]
     async fn no_repersist_after_reload() {
         let store = MemoryStore::default();
-        
+
         // Create, write data, and persist
         {
             let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
@@ -827,9 +844,9 @@ mod test {
             sync_kv.set(b"key1", b"value1");
             sync_kv.persist().await.unwrap();
         }
-        
+
         let initial_data = store.get("test/data.ysweet").await.unwrap().unwrap();
-        
+
         // Reload and immediately persist without changes
         {
             let sync_kv = SyncKv::new(Some(Arc::new(Box::new(store.clone()))), "test", || ())
@@ -839,7 +856,7 @@ mod test {
             sync_kv.mark_dirty();
             sync_kv.persist().await.unwrap();
         }
-        
+
         let after_data = store.get("test/data.ysweet").await.unwrap().unwrap();
         assert_eq!(initial_data, after_data, "Should not re-persist unchanged loaded data");
     }

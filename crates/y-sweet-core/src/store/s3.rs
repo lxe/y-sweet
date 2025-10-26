@@ -35,7 +35,7 @@ impl S3Store {
     pub fn new(config: S3Config) -> Self {
         // Ensure SSL_CERT_FILE is set to help rustls find native certificates
         Self::ensure_ssl_cert_file_set();
-        
+
         S3Store {
             client: OnceLock::new(),
             config,
@@ -53,7 +53,7 @@ impl S3Store {
                 "/etc/ssl/ca-bundle.pem",               // OpenSUSE
                 "/etc/ssl/cert.pem",                    // Alpine
             ];
-            
+
             for cert_path in &cert_paths {
                 if std::path::Path::new(cert_path).exists() {
                     env::set_var("SSL_CERT_FILE", cert_path);
@@ -102,9 +102,9 @@ impl S3Store {
         }
 
         let aws_config = aws_config_builder.load().await;
-        
+
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&aws_config);
-        
+
         if self.config.path_style {
             s3_config_builder = s3_config_builder.force_path_style(true);
         }
@@ -119,7 +119,7 @@ impl S3Store {
     }
 
     /// Helper function to handle AWS SDK errors and convert them to StoreError
-    fn handle_aws_error<E>(error: SdkError<E>, operation: &str, bucket: &str, key: Option<&str>) -> StoreError 
+    fn handle_aws_error<E>(error: SdkError<E>, operation: &str, bucket: &str, key: Option<&str>) -> StoreError
     where
         E: std::fmt::Debug + std::fmt::Display,
     {
@@ -131,7 +131,7 @@ impl S3Store {
                 let body = raw_response.body().bytes().map(|bytes| {
                     String::from_utf8_lossy(bytes).to_string()
                 }).unwrap_or_else(|| "<body not available>".to_string());
-                
+
                 tracing::error!(
                     error_type = "ServiceError",
                     operation = operation,
@@ -143,7 +143,7 @@ impl S3Store {
                     service_error = %service_error.err(),
                     "AWS S3 service error occurred"
                 );
-                
+
                 match status_code {
                     404 => StoreError::DoesNotExist("Object not found".to_string()),
                     403 => StoreError::NotAuthorized("Access denied".to_string()),
@@ -223,11 +223,11 @@ impl S3Store {
         }
 
         let client = self.get_client().await?;
-        
+
         match client.head_bucket()
             .bucket(&self.config.bucket)
             .send()
-            .await 
+            .await
         {
             Ok(_) => {
                 self._bucket_checked.set(()).unwrap();
@@ -250,12 +250,12 @@ impl S3Store {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
         let client = self.get_client().await?;
-        
+
         match client.get_object()
             .bucket(&self.config.bucket)
             .key(&prefixed_key)
             .send()
-            .await 
+            .await
         {
             Ok(output) => {
                 let bytes = output.body.collect().await
@@ -275,13 +275,13 @@ impl S3Store {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
         let client = self.get_client().await?;
-        
+
         match client.put_object()
             .bucket(&self.config.bucket)
             .key(&prefixed_key)
             .body(ByteStream::from(value))
             .send()
-            .await 
+            .await
         {
             Ok(_) => Ok(()),
             Err(err) => Err(Self::handle_aws_error(err, "put_object", &self.config.bucket, Some(&prefixed_key))),
@@ -292,12 +292,12 @@ impl S3Store {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
         let client = self.get_client().await?;
-        
+
         match client.delete_object()
             .bucket(&self.config.bucket)
             .key(&prefixed_key)
             .send()
-            .await 
+            .await
         {
             Ok(_) => Ok(()),
             Err(err) => Err(Self::handle_aws_error(err, "delete_object", &self.config.bucket, Some(&prefixed_key))),
@@ -308,12 +308,12 @@ impl S3Store {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
         let client = self.get_client().await?;
-        
+
         match client.head_object()
             .bucket(&self.config.bucket)
             .key(&prefixed_key)
             .send()
-            .await 
+            .await
         {
             Ok(_) => Ok(true),
             Err(err) => {
@@ -359,22 +359,22 @@ impl S3Store {
     async fn list_snapshots_impl(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
         let prefix = self.prefixed_key(&self.snapshots_prefix(key));
         let client = self.get_client().await?;
-        
+
         let mut snapshots = Vec::new();
         let mut continuation_token = None;
-        
+
         loop {
             let mut request = client.list_objects_v2()
                 .bucket(&self.config.bucket)
                 .prefix(&prefix);
-                
+
             if let Some(token) = continuation_token {
                 request = request.continuation_token(token);
             }
-            
+
             let response = request.send().await
                 .map_err(|e| StoreError::ConnectionError(format!("Failed to list snapshots: {}", e)))?;
-            
+
             if let Some(contents) = response.contents {
                 for object in contents {
                     if let (Some(obj_key), Some(size)) = (object.key, object.size) {
@@ -388,14 +388,14 @@ impl S3Store {
                     }
                 }
             }
-            
+
             if response.is_truncated == Some(true) {
                 continuation_token = response.next_continuation_token;
             } else {
                 break;
             }
         }
-        
+
         snapshots.sort_by_key(|s| s.timestamp);
         Ok(snapshots)
     }
@@ -451,6 +451,12 @@ impl Store for S3Store {
         self.create_snapshot_impl(key, timestamp).await
     }
 
+    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()> {
+        let snapshot_key = self.snapshot_key(key, timestamp);
+        tracing::info!(key = %key, snapshot_key = %snapshot_key, timestamp = timestamp, size = data.len(), "Creating snapshot with Yjs data");
+        self.set(&snapshot_key, data).await
+    }
+
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
         self.list_snapshots_impl(key).await
     }
@@ -493,6 +499,12 @@ impl Store for S3Store {
 
     async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
         self.create_snapshot_impl(key, timestamp).await
+    }
+
+    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()> {
+        let snapshot_key = self.snapshot_key(key, timestamp);
+        tracing::info!(key = %key, snapshot_key = %snapshot_key, timestamp = timestamp, size = data.len(), "Creating snapshot with Yjs data");
+        self.set(&snapshot_key, data).await
     }
 
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {

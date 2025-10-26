@@ -78,29 +78,34 @@ impl Store for FileSystemStore {
         Ok(())
     }
 
+    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()> {
+        let snapshot_key = self.snapshot_key(key, timestamp);
+        self.set(&snapshot_key, data).await
+    }
+
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
         let snapshots_dir = self.snapshots_dir(key);
-        
+
         let mut snapshots = Vec::new();
-        
+
         if !snapshots_dir.exists() {
             return Ok(snapshots);
         }
-        
+
         let entries = std::fs::read_dir(&snapshots_dir)
             .map_err(|e| StoreError::ConnectionError(format!("Failed to read snapshots directory: {}", e)))?;
-        
+
         for entry in entries {
             let entry = entry
                 .map_err(|e| StoreError::ConnectionError(format!("Failed to read directory entry: {}", e)))?;
-            
+
             let filename = entry.file_name();
             let filename_str = filename.to_string_lossy();
-            
+
             if let Some(timestamp) = self.extract_timestamp_from_filename(&filename_str) {
                 let metadata = entry.metadata()
                     .map_err(|e| StoreError::ConnectionError(format!("Failed to read file metadata: {}", e)))?;
-                
+
                 snapshots.push(SnapshotInfo {
                     timestamp,
                     size: metadata.len() as usize,
@@ -108,7 +113,7 @@ impl Store for FileSystemStore {
                 });
             }
         }
-        
+
         snapshots.sort_by_key(|s| s.timestamp);
         Ok(snapshots)
     }

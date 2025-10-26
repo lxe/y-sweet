@@ -164,13 +164,18 @@ impl Server {
             .await
             .map_err(|e| anyhow!("Error persisting: {:?}", e))?;
 
+        // Check if we should create an automatic snapshot
+        if let Err(e) = dwskv.check_and_create_automatic_snapshot().await {
+            tracing::error!(?e, "Error checking for automatic snapshot during load.");
+        }
+
         match self.docs.entry(doc_id.to_string()) {
             Entry::Occupied(_) => {
                 tracing::info!(doc_id=?doc_id, "Document already loaded by another task, skipping worker spawn");
             }
             Entry::Vacant(entry) => {
                 entry.insert(dwskv);
-                
+
                 let sync_kv = self.docs.get(doc_id).unwrap().sync_kv();
                 let checkpoint_freq = self.checkpoint_freq;
                 let doc_id = doc_id.to_string();
@@ -181,6 +186,7 @@ impl Server {
                     Self::doc_persistence_worker(
                         recv,
                         sync_kv,
+                        self.docs.clone(),
                         checkpoint_freq,
                         doc_id.clone(),
                         cancellation_token.clone(),
@@ -250,6 +256,7 @@ impl Server {
     async fn doc_persistence_worker(
         mut recv: Receiver<()>,
         sync_kv: Arc<SyncKv>,
+        docs: Arc<DashMap<String, DocWithSyncKv>>,
         checkpoint_freq: Duration,
         doc_id: String,
         cancellation_token: CancellationToken,
@@ -293,10 +300,25 @@ impl Server {
                 }
             }
             tracing::info!("Persisting.");
-            if let Err(e) = sync_kv.persist().await {
-                tracing::error!(?e, "Error persisting.");
-            } else {
-                tracing::info!("Done persisting.");
+            let persist_success = match sync_kv.persist().await {
+                Ok(()) => {
+                    tracing::info!("Done persisting.");
+                    true
+                }
+                Err(e) => {
+                    tracing::error!("Error persisting: {:?}", e);
+                    false
+                }
+            };
+            
+            // Check if we should create an automatic snapshot (now at DocWithSyncKv level)
+            // Only do this if persistence succeeded
+            if persist_success {
+                if let Some(doc) = docs.get(&doc_id) {
+                    if let Err(e) = doc.check_and_create_automatic_snapshot().await {
+                        tracing::error!("Error checking for automatic snapshot: {}", e);
+                    }
+                }
             }
             last_save = std::time::Instant::now();
 
@@ -854,11 +876,11 @@ async fn list_snapshots(
 
     server_state.load_doc(&doc_id).await
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    
+
     if let Some(doc) = server_state.docs.get(&doc_id) {
         let snapshots = doc.sync_kv().list_snapshots().await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to list snapshots: {}", e)))?;
-        
+
         let snapshots_json: Vec<Value> = snapshots
             .iter()
             .map(|s| json!({
@@ -867,7 +889,7 @@ async fn list_snapshots(
                 "hash": s.hash,
             }))
             .collect();
-        
+
         Ok(Json(json!({ "snapshots": snapshots_json })))
     } else {
         Err((StatusCode::NOT_FOUND, anyhow!("Document not found")))?
@@ -881,23 +903,24 @@ async fn create_snapshot(
 ) -> Result<Json<Value>, AppError> {
     let token = get_token_from_header(auth_header);
     let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
-    
+
     if !matches!(authorization, Authorization::Full) {
         return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Unauthorized.")));
     }
 
     server_state.load_doc(&doc_id).await
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    
+
     if let Some(doc) = server_state.docs.get(&doc_id) {
-        let timestamp = doc.sync_kv().create_snapshot(None).await
+        let timestamp = doc.create_snapshot(None).await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to create snapshot: {}", e)))?;
-        
+
         Ok(Json(json!({ "timestamp": timestamp })))
     } else {
         Err((StatusCode::NOT_FOUND, anyhow!("Document not found")))?
     }
 }
+
 
 async fn get_snapshot(
     State(server_state): State<Arc<Server>>,
@@ -911,9 +934,10 @@ async fn get_snapshot(
         let key = format!("{}/data.ysweet", doc_id);
         let snapshot_data = store.get_snapshot(&key, timestamp).await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to get snapshot: {}", e)))?;
-        
-        if let Some(data) = snapshot_data {
-            Ok(data)
+
+        if let Some(yjs_data) = snapshot_data {
+            // Snapshots are now stored in Yjs format, return directly
+            Ok(yjs_data)
         } else {
             Err((StatusCode::NOT_FOUND, anyhow!("Snapshot not found")))?
         }
@@ -929,25 +953,25 @@ async fn restore_snapshot(
 ) -> Result<Json<Value>, AppError> {
     let token = get_token_from_header(auth_header);
     let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
-    
+
     if !matches!(authorization, Authorization::Full) {
         return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Unauthorized.")));
     }
 
     server_state.load_doc(&doc_id).await
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    
+
     if let Some(doc) = server_state.docs.get(&doc_id) {
         // Restore the snapshot in storage
         doc.restore_from_snapshot(timestamp).await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to restore snapshot: {}", e)))?;
-        
+
         // Remove the document from memory, which will close all WebSocket connections
         // Clients will need to reconnect to receive the restored state
         drop(doc);
         server_state.docs.remove(&doc_id);
-        
-        Ok(Json(json!({ 
+
+        Ok(Json(json!({
             "restored": timestamp,
             "note": "All clients have been disconnected and must reconnect to sync the restored state"
         })))
@@ -963,18 +987,18 @@ async fn delete_snapshot(
 ) -> Result<Json<Value>, AppError> {
     let token = get_token_from_header(auth_header);
     let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
-    
+
     if !matches!(authorization, Authorization::Full) {
         return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Unauthorized.")));
     }
 
     server_state.load_doc(&doc_id).await
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    
+
     if let Some(doc) = server_state.docs.get(&doc_id) {
         doc.sync_kv().delete_snapshot(timestamp).await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to delete snapshot: {}", e)))?;
-        
+
         Ok(Json(json!({ "deleted": timestamp })))
     } else {
         Err((StatusCode::NOT_FOUND, anyhow!("Document not found")))?
@@ -1079,7 +1103,7 @@ mod test {
         );
 
         let doc_id = "test-concurrent-doc";
-        
+
         let tasks: Vec<_> = (0..10)
             .map(|i| {
                 let server = server.clone();
@@ -1092,7 +1116,7 @@ mod test {
             .collect();
 
         let results: Vec<_> = futures::future::join_all(tasks).await;
-        
+
         for (i, result) in results.into_iter().enumerate() {
             assert!(result.is_ok(), "Task {} failed to join", i);
             assert!(result.unwrap().is_ok(), "Task {} load_doc failed", i);
