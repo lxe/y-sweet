@@ -36,14 +36,14 @@ impl Store for MemoryStore {
 
     async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
         if let Some(data) = self.get(key).await? {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
+            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
             self.set(&snapshot_key, data).await?;
         }
         Ok(())
     }
 
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
-        let prefix = format!("{}.version.", key);
+        let prefix = format!("{}.snapshot.", key);
         let mut snapshots = Vec::new();
 
         for entry in self.data.iter() {
@@ -63,12 +63,12 @@ impl Store for MemoryStore {
     }
 
     async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>> {
-        let snapshot_key = format!("{}.version.{}", key, timestamp);
+        let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
         self.get(&snapshot_key).await
     }
 
     async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
-        let snapshot_key = format!("{}.version.{}", key, timestamp);
+        let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
         if let Some(snapshot_data) = self.get(&snapshot_key).await? {
             self.set(key, snapshot_data).await?;
         } else {
@@ -78,7 +78,7 @@ impl Store for MemoryStore {
     }
 
     async fn delete_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
-        let snapshot_key = format!("{}.version.{}", key, timestamp);
+        let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
         self.remove(&snapshot_key).await
     }
 }

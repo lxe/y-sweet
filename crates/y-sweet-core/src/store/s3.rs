@@ -326,17 +326,17 @@ impl S3Store {
     }
 
     fn snapshot_key(&self, base_key: &str, timestamp: u64) -> String {
-        base_key.replace("/data.ysweet", &format!("/versions/version.{}.ysweet", timestamp))
+        base_key.replace("/data.ysweet", &format!("/snapshots/snapshot.{}.ysweet", timestamp))
     }
 
     fn snapshots_prefix(&self, base_key: &str) -> String {
-        base_key.replace("/data.ysweet", "/versions/")
+        base_key.replace("/data.ysweet", "/snapshots/")
     }
 
     fn extract_timestamp_from_key(&self, key: &str) -> Option<u64> {
-        // Extract timestamp from "prefix/versions/version.1234567890.ysweet"
+        // Extract timestamp from "prefix/snapshots/snapshot.1234567890.ysweet"
         if let Some(filename) = key.split('/').last() {
-            if let Some(timestamp_str) = filename.strip_prefix("version.").and_then(|s| s.strip_suffix(".ysweet")) {
+            if let Some(timestamp_str) = filename.strip_prefix("snapshot.").and_then(|s| s.strip_suffix(".ysweet")) {
                 timestamp_str.parse().ok()
             } else {
                 None
