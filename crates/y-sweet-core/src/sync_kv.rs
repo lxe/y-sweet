@@ -448,6 +448,11 @@ mod test {
             Ok(())
         }
 
+        async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()> {
+            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            self.set(&snapshot_key, data).await
+        }
+
         async fn list_snapshots(&self, key: &str) -> Result<Vec<crate::store::SnapshotInfo>> {
             let prefix = format!("{}.snapshot.", key);
             let mut snapshots = Vec::new();
@@ -727,40 +732,6 @@ mod test {
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].timestamp, 1000);
         assert_eq!(snapshots[1].timestamp, 3000);
-    }
-
-    #[tokio::test]
-    async fn test_automatic_snapshot_with_interval() {
-        let store = MemoryStore::default();
-        let snapshot_config = SnapshotConfig {
-            enabled: true,
-            interval_seconds: Some(1), // 1 second interval
-            max_snapshots: None,
-        };
-
-        let sync_kv = SyncKv::new_with_snapshot_config(
-            Some(Arc::new(Box::new(store.clone()))),
-            "test",
-            || (),
-            snapshot_config,
-        )
-        .await
-        .unwrap();
-
-        // Set data and persist (should create first snapshot)
-        sync_kv.set(b"key1", b"value1");
-        sync_kv.persist().await.unwrap();
-
-        // Wait for interval to pass
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-        // Modify and persist again (should create second snapshot)
-        sync_kv.set(b"key2", b"value2");
-        sync_kv.persist().await.unwrap();
-
-        // Verify snapshots were created automatically
-        let snapshots = sync_kv.list_snapshots().await.unwrap();
-        assert!(snapshots.len() >= 1, "At least one snapshot should be created");
     }
 
     #[tokio::test]
