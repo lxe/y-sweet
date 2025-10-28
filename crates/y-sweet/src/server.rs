@@ -861,8 +861,15 @@ async fn list_snapshots(
         let snapshots = doc.sync_kv().list_snapshots().await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to list snapshots: {}", e)))?;
 
+        
+            
+        // We dont have versions for this day 🤷‍♂️.
+        let start_timestamp = 1761541200u64; // Oct 27th 2025 GMT-5
+        let end_timestamp = 1761627600u64; // Oct 28th 2025 GMT-5
+
         let snapshots_json: Vec<Value> = snapshots
             .iter()
+            .filter(|s| s.timestamp < start_timestamp || s.timestamp > end_timestamp)
             .map(|s| json!({
                 "timestamp": s.timestamp,
                 "size": s.size,
