@@ -115,89 +115,9 @@ impl DocWithSyncKv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Result as StoreResult, StoreError, SnapshotInfo};
-    use async_trait::async_trait;
-    use dashmap::DashMap;
     use std::sync::Arc;
     use yrs::{Map, Transact, WriteTxn};
-
-    #[derive(Default, Clone)]
-    struct MemoryStore {
-        data: Arc<DashMap<String, Vec<u8>>>,
-    }
-
-    #[async_trait]
-    impl Store for MemoryStore {
-        async fn init(&self) -> StoreResult<()> {
-            Ok(())
-        }
-
-        async fn get(&self, key: &str) -> StoreResult<Option<Vec<u8>>> {
-            Ok(self.data.get(key).map(|v| v.clone()))
-        }
-
-        async fn set(&self, key: &str, value: Vec<u8>) -> StoreResult<()> {
-            self.data.insert(key.to_string(), value);
-            Ok(())
-        }
-
-        async fn remove(&self, key: &str) -> StoreResult<()> {
-            self.data.remove(key);
-            Ok(())
-        }
-
-        async fn exists(&self, key: &str) -> StoreResult<bool> {
-            Ok(self.data.contains_key(key))
-        }
-
-        async fn create_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
-            if let Some(data) = self.get(key).await? {
-                let snapshot_key = format!("{}.version.{}", key, timestamp);
-                self.set(&snapshot_key, data).await?;
-            }
-            Ok(())
-        }
-
-        async fn list_snapshots(&self, key: &str) -> StoreResult<Vec<SnapshotInfo>> {
-            let prefix = format!("{}.version.", key);
-            let mut snapshots = Vec::new();
-
-            for entry in self.data.iter() {
-                if let Some(timestamp_str) = entry.key().strip_prefix(&prefix) {
-                    if let Ok(timestamp) = timestamp_str.parse::<u64>() {
-                        snapshots.push(SnapshotInfo {
-                            timestamp,
-                            size: entry.value().len(),
-                            hash: 0,
-                        });
-                    }
-                }
-            }
-
-            snapshots.sort_by_key(|s| s.timestamp);
-            Ok(snapshots)
-        }
-
-        async fn get_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<Option<Vec<u8>>> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            self.get(&snapshot_key).await
-        }
-
-        async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            if let Some(snapshot_data) = self.get(&snapshot_key).await? {
-                self.set(key, snapshot_data).await?;
-            } else {
-                return Err(StoreError::DoesNotExist(format!("Snapshot {} not found", timestamp)));
-            }
-            Ok(())
-        }
-
-        async fn delete_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            self.remove(&snapshot_key).await
-        }
-    }
+    use crate::store::memory::MemoryStore;
 
     #[tokio::test]
     async fn test_snapshot_restore_and_reload() {
