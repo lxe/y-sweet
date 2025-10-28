@@ -386,8 +386,6 @@ impl Server {
             .route("/doc/:doc_id/snapshots", get(list_snapshots))
             .route("/doc/:doc_id/snapshots", post(create_snapshot))
             .route("/doc/:doc_id/snapshots/:timestamp", get(get_snapshot))
-            .route("/doc/:doc_id/snapshots/:timestamp", post(restore_snapshot))
-            .route("/doc/:doc_id/snapshots/:timestamp", axum::routing::delete(delete_snapshot))
             .route("/d/:doc_id/as-update", get(get_doc_as_update))
             .route("/d/:doc_id/update", post(update_doc))
             .route(
@@ -943,65 +941,6 @@ async fn get_snapshot(
         }
     } else {
         Err((StatusCode::NOT_FOUND, anyhow!("No store configured")))?
-    }
-}
-
-async fn restore_snapshot(
-    State(server_state): State<Arc<Server>>,
-    Path((doc_id, timestamp)): Path<(String, u64)>,
-    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
-) -> Result<Json<Value>, AppError> {
-    let token = get_token_from_header(auth_header);
-    let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
-
-    if !matches!(authorization, Authorization::Full) {
-        return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Unauthorized.")));
-    }
-
-    server_state.load_doc(&doc_id).await
-        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    if let Some(doc) = server_state.docs.get(&doc_id) {
-        // Restore the snapshot in storage
-        doc.restore_from_snapshot(timestamp).await
-            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to restore snapshot: {}", e)))?;
-
-        // Remove the document from memory, which will close all WebSocket connections
-        // Clients will need to reconnect to receive the restored state
-        drop(doc);
-        server_state.docs.remove(&doc_id);
-
-        Ok(Json(json!({
-            "restored": timestamp,
-            "note": "All clients have been disconnected and must reconnect to sync the restored state"
-        })))
-    } else {
-        Err((StatusCode::NOT_FOUND, anyhow!("Document not found")))?
-    }
-}
-
-async fn delete_snapshot(
-    State(server_state): State<Arc<Server>>,
-    Path((doc_id, timestamp)): Path<(String, u64)>,
-    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
-) -> Result<Json<Value>, AppError> {
-    let token = get_token_from_header(auth_header);
-    let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
-
-    if !matches!(authorization, Authorization::Full) {
-        return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Unauthorized.")));
-    }
-
-    server_state.load_doc(&doc_id).await
-        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    if let Some(doc) = server_state.docs.get(&doc_id) {
-        doc.sync_kv().delete_snapshot(timestamp).await
-            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to delete snapshot: {}", e)))?;
-
-        Ok(Json(json!({ "deleted": timestamp })))
-    } else {
-        Err((StatusCode::NOT_FOUND, anyhow!("Document not found")))?
     }
 }
 
