@@ -367,7 +367,7 @@ impl Server {
             .route("/doc/:doc_id/snapshots", get(list_snapshots))
             .route("/doc/:doc_id/snapshots", post(create_snapshot))
             .route("/doc/:doc_id/snapshots/:timestamp", get(get_snapshot))
-            .route("/doc/:doc_uid/snapshots/:timestamp/as-update", get(get_snapshot_as_update))
+            .route("/doc/:doc_id/snapshots/:timestamp/as-update", get(get_snapshot_as_update))
             .route("/d/:doc_id/as-update", get(get_doc_as_update))
             .route("/d/:doc_id/update", post(update_doc))
             .route(
