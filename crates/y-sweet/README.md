@@ -15,3 +15,8 @@
 ## `y-sweet` crate
 
 The y-sweet crate is primarily intended to be used as a binary, but can also be used as a library. See `main.rs` for usage examples.
+
+
+## Running locally
+
+    PORT=8081 Y_SWEET_SNAPSHOT_ENABLE=true Y_SWEET_SNAPSHOT_INTERVAL_SECONDS=60 cargo run serve data
