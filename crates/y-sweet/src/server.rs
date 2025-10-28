@@ -43,6 +43,8 @@ use y_sweet_core::{
     sync_kv::{SyncKv, SnapshotConfig},
 };
 
+use crate::convert;
+
 const PLANE_VERIFIED_USER_DATA_HEADER: &str = "x-verified-user-data";
 
 // Every 20 seconds, we send a ping to the client.
@@ -936,8 +938,9 @@ async fn get_snapshot_as_update(
         let snapshot_data = store.get_snapshot(&key, timestamp).await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to get snapshot: {}", e)))?;
         if let Some(data) = snapshot_data {
-            // TODO convert to update
-            Ok(data)
+            let update = convert::convert_snapshot_to_update(&data, &doc_id).await
+                .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to convert snapshot to update: {}", e)))?;
+            Ok(update)
         } else {
             Err((StatusCode::NOT_FOUND, anyhow!("Snapshot not found")))?
         }
