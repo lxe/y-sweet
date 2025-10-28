@@ -1,4 +1,5 @@
 pub mod s3;
+pub mod memory;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -35,7 +36,6 @@ pub trait Store: 'static {
 
     // Snapshot operations
     async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
-    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()>;
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>>;
     async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>>;
     async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
@@ -53,7 +53,6 @@ pub trait Store: Send + Sync {
 
     // Snapshot operations
     async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;
-    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()>;
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>>;
     async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>>;
     async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()>;

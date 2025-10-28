@@ -95,42 +95,6 @@ impl DocWithSyncKv {
         Ok(())
     }
 
-    /// Create a snapshot with proper Yjs binary format.
-    /// This creates a snapshot that can be directly applied with Y.applyUpdate() on the client.
-    pub async fn create_snapshot(&self, timestamp: Option<u64>) -> Result<u64> {
-        let timestamp = timestamp.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
-
-        // Get the document as a Yjs binary update
-        let yjs_data = self.as_update();
-
-        // Use the SyncKv's create_snapshot method but pass the Yjs data
-        self.sync_kv.create_snapshot_with_yjs_data(Some(timestamp), yjs_data).await
-            .map_err(|e| anyhow!("Failed to create snapshot: {}", e))?;
-
-        Ok(timestamp)
-    }
-
-    /// Check if an automatic snapshot should be created and create it if needed.
-    /// This should be called after document persistence.
-    pub async fn check_and_create_automatic_snapshot(&self) -> Result<()> {
-        if self.sync_kv.should_create_snapshot() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            if let Err(e) = self.create_snapshot(Some(timestamp)).await {
-                tracing::error!(?e, "Failed to create automatic snapshot");
-            }
-        }
-        Ok(())
-    }
-
     /// Restore the document from a snapshot at the given timestamp.
     /// This restores the snapshot and **disconnects all clients**, requiring them to reconnect
     /// to receive the restored state. Yjs CRDTs merge updates rather than replacing state,
@@ -151,94 +115,9 @@ impl DocWithSyncKv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Result as StoreResult, StoreError, SnapshotInfo};
-    use async_trait::async_trait;
-    use dashmap::DashMap;
     use std::sync::Arc;
     use yrs::{Map, Transact, WriteTxn};
-
-    #[derive(Default, Clone)]
-    struct MemoryStore {
-        data: Arc<DashMap<String, Vec<u8>>>,
-    }
-
-    #[async_trait]
-    impl Store for MemoryStore {
-        async fn init(&self) -> StoreResult<()> {
-            Ok(())
-        }
-
-        async fn get(&self, key: &str) -> StoreResult<Option<Vec<u8>>> {
-            Ok(self.data.get(key).map(|v| v.clone()))
-        }
-
-        async fn set(&self, key: &str, value: Vec<u8>) -> StoreResult<()> {
-            self.data.insert(key.to_string(), value);
-            Ok(())
-        }
-
-        async fn remove(&self, key: &str) -> StoreResult<()> {
-            self.data.remove(key);
-            Ok(())
-        }
-
-        async fn exists(&self, key: &str) -> StoreResult<bool> {
-            Ok(self.data.contains_key(key))
-        }
-
-        async fn create_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
-            if let Some(data) = self.get(key).await? {
-                let snapshot_key = format!("{}.version.{}", key, timestamp);
-                self.set(&snapshot_key, data).await?;
-            }
-            Ok(())
-        }
-
-        async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> StoreResult<()> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            self.set(&snapshot_key, data).await
-        }
-
-        async fn list_snapshots(&self, key: &str) -> StoreResult<Vec<SnapshotInfo>> {
-            let prefix = format!("{}.version.", key);
-            let mut snapshots = Vec::new();
-
-            for entry in self.data.iter() {
-                if let Some(timestamp_str) = entry.key().strip_prefix(&prefix) {
-                    if let Ok(timestamp) = timestamp_str.parse::<u64>() {
-                        snapshots.push(SnapshotInfo {
-                            timestamp,
-                            size: entry.value().len(),
-                            hash: 0,
-                        });
-                    }
-                }
-            }
-
-            snapshots.sort_by_key(|s| s.timestamp);
-            Ok(snapshots)
-        }
-
-        async fn get_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<Option<Vec<u8>>> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            self.get(&snapshot_key).await
-        }
-
-        async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            if let Some(snapshot_data) = self.get(&snapshot_key).await? {
-                self.set(key, snapshot_data).await?;
-            } else {
-                return Err(StoreError::DoesNotExist(format!("Snapshot {} not found", timestamp)));
-            }
-            Ok(())
-        }
-
-        async fn delete_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            self.remove(&snapshot_key).await
-        }
-    }
+    use crate::store::memory::MemoryStore;
 
     #[tokio::test]
     async fn test_snapshot_restore_and_reload() {

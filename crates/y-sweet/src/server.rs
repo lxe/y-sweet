@@ -43,6 +43,8 @@ use y_sweet_core::{
     sync_kv::{SyncKv, SnapshotConfig},
 };
 
+use crate::convert;
+
 const PLANE_VERIFIED_USER_DATA_HEADER: &str = "x-verified-user-data";
 
 // Every 20 seconds, we send a ping to the client.
@@ -164,11 +166,6 @@ impl Server {
             .await
             .map_err(|e| anyhow!("Error persisting: {:?}", e))?;
 
-        // Check if we should create an automatic snapshot
-        if let Err(e) = dwskv.check_and_create_automatic_snapshot().await {
-            tracing::error!(?e, "Error checking for automatic snapshot during load.");
-        }
-
         match self.docs.entry(doc_id.to_string()) {
             Entry::Occupied(_) => {
                 tracing::info!(doc_id=?doc_id, "Document already loaded by another task, skipping worker spawn");
@@ -186,7 +183,6 @@ impl Server {
                     Self::doc_persistence_worker(
                         recv,
                         sync_kv,
-                        self.docs.clone(),
                         checkpoint_freq,
                         doc_id.clone(),
                         cancellation_token.clone(),
@@ -256,7 +252,6 @@ impl Server {
     async fn doc_persistence_worker(
         mut recv: Receiver<()>,
         sync_kv: Arc<SyncKv>,
-        docs: Arc<DashMap<String, DocWithSyncKv>>,
         checkpoint_freq: Duration,
         doc_id: String,
         cancellation_token: CancellationToken,
@@ -300,25 +295,11 @@ impl Server {
                 }
             }
             tracing::info!("Persisting.");
-            let persist_success = match sync_kv.persist().await {
-                Ok(()) => {
-                    tracing::info!("Done persisting.");
-                    true
-                }
-                Err(e) => {
-                    tracing::error!("Error persisting: {:?}", e);
-                    false
-                }
-            };
-            
-            // Check if we should create an automatic snapshot (now at DocWithSyncKv level)
-            // Only do this if persistence succeeded
-            if persist_success {
-                if let Some(doc) = docs.get(&doc_id) {
-                    if let Err(e) = doc.check_and_create_automatic_snapshot().await {
-                        tracing::error!("Error checking for automatic snapshot: {}", e);
-                    }
-                }
+
+            if let Err(e) = sync_kv.persist().await {
+                tracing::error!(?e, "Error persisting.");
+            } else {
+                tracing::info!("Done persisting.");
             }
             last_save = std::time::Instant::now();
 
@@ -386,6 +367,7 @@ impl Server {
             .route("/doc/:doc_id/snapshots", get(list_snapshots))
             .route("/doc/:doc_id/snapshots", post(create_snapshot))
             .route("/doc/:doc_id/snapshots/:timestamp", get(get_snapshot))
+            .route("/doc/:doc_id/snapshots/:timestamp/as-update", get(get_snapshot_as_update))
             .route("/d/:doc_id/as-update", get(get_doc_as_update))
             .route("/d/:doc_id/update", post(update_doc))
             .route(
@@ -879,8 +861,15 @@ async fn list_snapshots(
         let snapshots = doc.sync_kv().list_snapshots().await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to list snapshots: {}", e)))?;
 
+        
+            
+        // We dont have versions for this day 🤷‍♂️.
+        let start_timestamp = 1761541200u64; // Oct 27th 2025 GMT-5
+        let end_timestamp = 1761627600u64; // Oct 28th 2025 GMT-5
+
         let snapshots_json: Vec<Value> = snapshots
             .iter()
+            .filter(|s| s.timestamp < start_timestamp || s.timestamp > end_timestamp)
             .map(|s| json!({
                 "timestamp": s.timestamp,
                 "size": s.size,
@@ -910,7 +899,7 @@ async fn create_snapshot(
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if let Some(doc) = server_state.docs.get(&doc_id) {
-        let timestamp = doc.create_snapshot(None).await
+        let timestamp = doc.sync_kv().create_snapshot(None).await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to create snapshot: {}", e)))?;
 
         Ok(Json(json!({ "timestamp": timestamp })))
@@ -933,9 +922,32 @@ async fn get_snapshot(
         let snapshot_data = store.get_snapshot(&key, timestamp).await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to get snapshot: {}", e)))?;
 
-        if let Some(yjs_data) = snapshot_data {
-            // Snapshots are now stored in Yjs format, return directly
-            Ok(yjs_data)
+        if let Some(data) = snapshot_data {
+            Ok(data)
+        } else {
+            Err((StatusCode::NOT_FOUND, anyhow!("Snapshot not found")))?
+        }
+    } else {
+        Err((StatusCode::NOT_FOUND, anyhow!("No store configured")))?
+    }
+}
+
+async fn get_snapshot_as_update(
+    State(server_state): State<Arc<Server>>,
+    Path((doc_id, timestamp)): Path<(String, u64)>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Vec<u8>, AppError> {
+    let token = get_token_from_header(auth_header);
+    let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+
+    if let Some(store) = &server_state.store {
+        let key = format!("{}/data.ysweet", doc_id);
+        let snapshot_data = store.get_snapshot(&key, timestamp).await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to get snapshot: {}", e)))?;
+        if let Some(data) = snapshot_data {
+            let update = convert::convert_snapshot_to_update(&data, &doc_id).await
+                .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to convert snapshot to update: {}", e)))?;
+            Ok(update)
         } else {
             Err((StatusCode::NOT_FOUND, anyhow!("Snapshot not found")))?
         }

@@ -132,8 +132,17 @@ impl SyncKv {
             // Update the last persisted hash atomically
             self.last_persisted_hash.store(current_hash, Ordering::Release);
 
-            // Note: Automatic snapshot creation moved to DocWithSyncKv level
-            // where we have access to Yjs document for proper format conversion
+            // Check if we should create a snapshot
+            if self.should_create_snapshot() {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                    
+                if let Err(e) = self.create_snapshot_internal(timestamp).await {
+                    tracing::error!(?e, "Failed to create automatic snapshot");
+                }
+            }
         }
 
         // Clear dirty flag after successful persist
@@ -241,31 +250,6 @@ impl SyncKv {
         });
 
         self.create_snapshot_internal(timestamp).await?;
-        Ok(timestamp)
-    }
-
-    /// Create a snapshot with provided Yjs binary data. Returns the timestamp of the created snapshot.
-    pub async fn create_snapshot_with_yjs_data(&self, timestamp: Option<u64>, yjs_data: Vec<u8>) -> Result<u64, Box<dyn std::error::Error>> {
-        let timestamp = timestamp.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
-
-        if let Some(store) = &self.store {
-            store.create_snapshot_with_data(&self.key, timestamp, yjs_data).await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-            self.last_snapshot_time.store(timestamp, Ordering::Release);
-
-            // Clean up old snapshots if needed
-            if let Some(max_snapshots) = self.snapshot_config.max_snapshots {
-                if let Err(e) = self.cleanup_old_snapshots(max_snapshots).await {
-                    tracing::error!(?e, "Failed to cleanup old snapshots");
-                }
-            }
-        }
-
         Ok(timestamp)
     }
 
@@ -404,95 +388,9 @@ impl<'a> yrs_kvstore::KVStore<'a> for SyncKv {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::store::{Result, StoreError};
-    use async_trait::async_trait;
-    use dashmap::DashMap;
     use std::sync::atomic::AtomicUsize;
     use tokio;
-
-    #[derive(Default, Clone)]
-    struct MemoryStore {
-        data: Arc<DashMap<String, Vec<u8>>>,
-    }
-
-    #[cfg_attr(not(feature = "single-threaded"), async_trait)]
-    #[cfg_attr(feature = "single-threaded", async_trait(?Send))]
-    impl Store for MemoryStore {
-        async fn init(&self) -> Result<()> {
-            Ok(())
-        }
-
-        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.data.get(key).map(|v| v.clone()))
-        }
-
-        async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
-            self.data.insert(key.to_owned(), value);
-            Ok(())
-        }
-
-        async fn remove(&self, key: &str) -> Result<()> {
-            self.data.remove(key);
-            Ok(())
-        }
-
-        async fn exists(&self, key: &str) -> Result<bool> {
-            Ok(self.data.contains_key(key))
-        }
-
-        async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
-            if let Some(data) = self.get(key).await? {
-                let snapshot_key = format!("{}.version.{}", key, timestamp);
-                self.set(&snapshot_key, data).await?;
-            }
-            Ok(())
-        }
-
-        async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            self.set(&snapshot_key, data).await
-        }
-
-        async fn list_snapshots(&self, key: &str) -> Result<Vec<crate::store::SnapshotInfo>> {
-            let prefix = format!("{}.version.", key);
-            let mut snapshots = Vec::new();
-
-            for entry in self.data.iter() {
-                if let Some(timestamp_str) = entry.key().strip_prefix(&prefix) {
-                    if let Ok(timestamp) = timestamp_str.parse::<u64>() {
-                        snapshots.push(crate::store::SnapshotInfo {
-                            timestamp,
-                            size: entry.value().len(),
-                            hash: 0,
-                        });
-                    }
-                }
-            }
-
-            snapshots.sort_by_key(|s| s.timestamp);
-            Ok(snapshots)
-        }
-
-        async fn get_snapshot(&self, key: &str, timestamp: u64) -> Result<Option<Vec<u8>>> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            self.get(&snapshot_key).await
-        }
-
-        async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            if let Some(snapshot_data) = self.get(&snapshot_key).await? {
-                self.set(key, snapshot_data).await?;
-            } else {
-                return Err(StoreError::DoesNotExist(format!("Snapshot {} not found", timestamp)));
-            }
-            Ok(())
-        }
-
-        async fn delete_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            self.remove(&snapshot_key).await
-        }
-    }
+    use crate::store::memory::MemoryStore;
 
     #[derive(Default, Clone)]
     struct CallbackCounter {
@@ -524,7 +422,7 @@ mod test {
         sync_kv.set(b"foo", b"bar");
         assert_eq!(sync_kv.get(b"foo"), Some(b"bar".to_vec()));
 
-        assert!(store.data.is_empty());
+        assert!(store.is_empty().await.unwrap());
 
         // We should have received a dirty callback.
         assert_eq!(c.count(), 1);
@@ -547,7 +445,7 @@ mod test {
             sync_kv.set(b"foo", b"bar");
             assert_eq!(sync_kv.get(b"foo"), Some(b"bar".to_vec()));
 
-            assert!(store.data.is_empty());
+            assert!(store.is_empty().await.unwrap());
 
             sync_kv.persist().await.unwrap();
         }
