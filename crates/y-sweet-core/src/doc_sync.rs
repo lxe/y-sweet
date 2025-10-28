@@ -188,19 +188,19 @@ mod tests {
 
         async fn create_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
             if let Some(data) = self.get(key).await? {
-                let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+                let snapshot_key = format!("{}.version.{}", key, timestamp);
                 self.set(&snapshot_key, data).await?;
             }
             Ok(())
         }
 
         async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> StoreResult<()> {
-            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            let snapshot_key = format!("{}.version.{}", key, timestamp);
             self.set(&snapshot_key, data).await
         }
 
         async fn list_snapshots(&self, key: &str) -> StoreResult<Vec<SnapshotInfo>> {
-            let prefix = format!("{}.snapshot.", key);
+            let prefix = format!("{}.version.", key);
             let mut snapshots = Vec::new();
 
             for entry in self.data.iter() {
@@ -220,12 +220,12 @@ mod tests {
         }
 
         async fn get_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<Option<Vec<u8>>> {
-            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            let snapshot_key = format!("{}.version.{}", key, timestamp);
             self.get(&snapshot_key).await
         }
 
         async fn restore_from_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
-            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            let snapshot_key = format!("{}.version.{}", key, timestamp);
             if let Some(snapshot_data) = self.get(&snapshot_key).await? {
                 self.set(key, snapshot_data).await?;
             } else {
@@ -235,7 +235,7 @@ mod tests {
         }
 
         async fn delete_snapshot(&self, key: &str, timestamp: u64) -> StoreResult<()> {
-            let snapshot_key = format!("{}.snapshot.{}", key, timestamp);
+            let snapshot_key = format!("{}.version.{}", key, timestamp);
             self.remove(&snapshot_key).await
         }
     }
