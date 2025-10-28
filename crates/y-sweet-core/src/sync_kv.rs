@@ -132,8 +132,17 @@ impl SyncKv {
             // Update the last persisted hash atomically
             self.last_persisted_hash.store(current_hash, Ordering::Release);
 
-            // Note: Automatic snapshot creation moved to DocWithSyncKv level
-            // where we have access to Yjs document for proper format conversion
+            // Check if we should create a snapshot
+            if self.should_create_snapshot() {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                    
+                if let Err(e) = self.create_snapshot_internal(timestamp).await {
+                    tracing::error!(?e, "Failed to create automatic snapshot");
+                }
+            }
         }
 
         // Clear dirty flag after successful persist
@@ -241,31 +250,6 @@ impl SyncKv {
         });
 
         self.create_snapshot_internal(timestamp).await?;
-        Ok(timestamp)
-    }
-
-    /// Create a snapshot with provided Yjs binary data. Returns the timestamp of the created snapshot.
-    pub async fn create_snapshot_with_yjs_data(&self, timestamp: Option<u64>, yjs_data: Vec<u8>) -> Result<u64, Box<dyn std::error::Error>> {
-        let timestamp = timestamp.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
-
-        if let Some(store) = &self.store {
-            store.create_snapshot_with_data(&self.key, timestamp, yjs_data).await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-            self.last_snapshot_time.store(timestamp, Ordering::Release);
-
-            // Clean up old snapshots if needed
-            if let Some(max_snapshots) = self.snapshot_config.max_snapshots {
-                if let Err(e) = self.cleanup_old_snapshots(max_snapshots).await {
-                    tracing::error!(?e, "Failed to cleanup old snapshots");
-                }
-            }
-        }
-
         Ok(timestamp)
     }
 
@@ -446,11 +430,6 @@ mod test {
                 self.set(&snapshot_key, data).await?;
             }
             Ok(())
-        }
-
-        async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()> {
-            let snapshot_key = format!("{}.version.{}", key, timestamp);
-            self.set(&snapshot_key, data).await
         }
 
         async fn list_snapshots(&self, key: &str) -> Result<Vec<crate::store::SnapshotInfo>> {

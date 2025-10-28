@@ -451,12 +451,6 @@ impl Store for S3Store {
         self.create_snapshot_impl(key, timestamp).await
     }
 
-    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()> {
-        let snapshot_key = self.snapshot_key(key, timestamp);
-        tracing::info!(key = %key, snapshot_key = %snapshot_key, timestamp = timestamp, size = data.len(), "Creating snapshot with Yjs data");
-        self.set(&snapshot_key, data).await
-    }
-
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
         self.list_snapshots_impl(key).await
     }
@@ -499,12 +493,6 @@ impl Store for S3Store {
 
     async fn create_snapshot(&self, key: &str, timestamp: u64) -> Result<()> {
         self.create_snapshot_impl(key, timestamp).await
-    }
-
-    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()> {
-        let snapshot_key = self.snapshot_key(key, timestamp);
-        tracing::info!(key = %key, snapshot_key = %snapshot_key, timestamp = timestamp, size = data.len(), "Creating snapshot with Yjs data");
-        self.set(&snapshot_key, data).await
     }
 
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {

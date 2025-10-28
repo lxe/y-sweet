@@ -78,11 +78,6 @@ impl Store for FileSystemStore {
         Ok(())
     }
 
-    async fn create_snapshot_with_data(&self, key: &str, timestamp: u64, data: Vec<u8>) -> Result<()> {
-        let snapshot_key = self.snapshot_key(key, timestamp);
-        self.set(&snapshot_key, data).await
-    }
-
     async fn list_snapshots(&self, key: &str) -> Result<Vec<SnapshotInfo>> {
         let snapshots_dir = self.snapshots_dir(key);
 

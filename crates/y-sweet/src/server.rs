@@ -164,11 +164,6 @@ impl Server {
             .await
             .map_err(|e| anyhow!("Error persisting: {:?}", e))?;
 
-        // Check if we should create an automatic snapshot
-        if let Err(e) = dwskv.check_and_create_automatic_snapshot().await {
-            tracing::error!(?e, "Error checking for automatic snapshot during load.");
-        }
-
         match self.docs.entry(doc_id.to_string()) {
             Entry::Occupied(_) => {
                 tracing::info!(doc_id=?doc_id, "Document already loaded by another task, skipping worker spawn");
@@ -186,7 +181,6 @@ impl Server {
                     Self::doc_persistence_worker(
                         recv,
                         sync_kv,
-                        self.docs.clone(),
                         checkpoint_freq,
                         doc_id.clone(),
                         cancellation_token.clone(),
@@ -256,7 +250,6 @@ impl Server {
     async fn doc_persistence_worker(
         mut recv: Receiver<()>,
         sync_kv: Arc<SyncKv>,
-        docs: Arc<DashMap<String, DocWithSyncKv>>,
         checkpoint_freq: Duration,
         doc_id: String,
         cancellation_token: CancellationToken,
@@ -300,25 +293,11 @@ impl Server {
                 }
             }
             tracing::info!("Persisting.");
-            let persist_success = match sync_kv.persist().await {
-                Ok(()) => {
-                    tracing::info!("Done persisting.");
-                    true
-                }
-                Err(e) => {
-                    tracing::error!("Error persisting: {:?}", e);
-                    false
-                }
-            };
-            
-            // Check if we should create an automatic snapshot (now at DocWithSyncKv level)
-            // Only do this if persistence succeeded
-            if persist_success {
-                if let Some(doc) = docs.get(&doc_id) {
-                    if let Err(e) = doc.check_and_create_automatic_snapshot().await {
-                        tracing::error!("Error checking for automatic snapshot: {}", e);
-                    }
-                }
+
+            if let Err(e) = sync_kv.persist().await {
+                tracing::error!(?e, "Error persisting.");
+            } else {
+                tracing::info!("Done persisting.");
             }
             last_save = std::time::Instant::now();
 
@@ -910,7 +889,7 @@ async fn create_snapshot(
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if let Some(doc) = server_state.docs.get(&doc_id) {
-        let timestamp = doc.create_snapshot(None).await
+        let timestamp = doc.sync_kv().create_snapshot(None).await
             .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to create snapshot: {}", e)))?;
 
         Ok(Json(json!({ "timestamp": timestamp })))
