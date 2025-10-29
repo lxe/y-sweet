@@ -16,17 +16,17 @@ impl FileSystemStore {
     }
 
     fn snapshot_key(&self, base_key: &str, timestamp: u64) -> String {
-        base_key.replace("/data.ysweet", &format!("/versions/version.{}.ysweet", timestamp))
+        base_key.replace("/data.ysweet", &format!("/snapshots/snapshot.{}.ysweet", timestamp))
     }
 
     fn snapshots_dir(&self, base_key: &str) -> PathBuf {
-        let snapshots_prefix = base_key.replace("/data.ysweet", "/versions/");
+        let snapshots_prefix = base_key.replace("/data.ysweet", "/snapshots/");
         self.base_path.join(snapshots_prefix)
     }
 
     fn extract_timestamp_from_filename(&self, filename: &str) -> Option<u64> {
         filename
-            .strip_prefix("version.")
+            .strip_prefix("snapshot.")
             .and_then(|s| s.strip_suffix(".ysweet"))
             .and_then(|s| s.parse().ok())
     }
